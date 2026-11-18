@@ -3,6 +3,7 @@ name = "pixlflow"
 version = "0.1.0"
 edition = "2021"
 description = "Pixlflow - pixel sorter"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # wgpu renderer: runs via DirectX 12 (with a software fallback) where OpenGL 2+ is missing

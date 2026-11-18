@@ -5,7 +5,11 @@
 
 mod gui;
 
-use pixlflow::{engine, imageio, settings::Settings};
+use pixlflow::{
+    engine, imageio,
+    settings::{Criterion, Settings},
+    video,
+};
 use std::{path::PathBuf, process::ExitCode, time::Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -20,6 +24,8 @@ struct Args {
     show_mask: bool,
     quiet: bool,
     gui: bool,
+    play: bool,
+    frame_at: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -93,6 +99,11 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "q" | "quiet" => a.quiet = true,
             "show-mask" => a.show_mask = true,
             "gui" => a.gui = true,
+            "play" => a.play = true,
+            "frame-at" => {
+                let v = value()?;
+                a.frame_at = Some(v.parse().ok().filter(|t: &f64| *t >= 0.0).ok_or(format!("invalid time '{v}' for '--frame-at'"))?);
+            }
             "mask" => a.mask = Some(value()?.into()),
             "guide" => a.guide = Some(value()?.into()),
             "preset" => a.settings.apply_preset(&value()?)?,
@@ -102,6 +113,9 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                 a.settings.set(key, &v)?;
             }
         }
+    }
+    if [a.settings.crit, a.settings.crit2].contains(&Criterion::Guide) {
+        return Err("'guide' can't be a threshold criterion (--crit, --crit2); use it to sort: --by guide".into());
     }
     let mut positional = positional.into_iter();
     a.input = positional.next();
@@ -116,7 +130,10 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
 }
 
 fn run(a: Args) -> Result<(), String> {
-    let input = a.input.unwrap_or_default();
+    let input = a.input.clone().unwrap_or_default();
+    if video::is_video(&input) {
+        return run_video(a, &input);
+    }
     let pic = imageio::load(&input)?;
     if pic.deep && !a.quiet {
         eprintln!("pixlflow: warning: '{}' has more than 8 bits per channel; reducing to 8 bits", input.display());
@@ -138,6 +155,58 @@ fn run(a: Args) -> Result<(), String> {
     imageio::save(&output, w, h, &out, alpha)?;
     if !a.quiet {
         eprintln!("pixlflow: {w}x{h} in {} ms -> {}", elapsed.as_millis(), output.display());
+    }
+    Ok(())
+}
+
+/// Sorts a whole video (or plays it sorted, or sorts one frame of it).
+fn run_video(a: Args, input: &std::path::Path) -> Result<(), String> {
+    let info = video::probe(input)?;
+    let (w, h) = (info.w, info.h);
+    let mask = a.mask.as_deref().map(|p| imageio::load_gray(p, w, h, false)).transpose()?;
+    let guide = a.guide.as_deref().map(|p| imageio::load_gray(p, w, h, true)).transpose()?;
+    let ex = engine::Extras { mask: mask.as_deref(), guide: guide.as_deref(), directions: None };
+    let sort = |px: Vec<pixlflow::Rgb>| {
+        if a.show_mask {
+            engine::selection_map(&a.settings, w, h, &px).into_iter().map(|v| [v; 3]).collect()
+        } else {
+            engine::render(&a.settings, w, h, &px, &ex)
+        }
+    };
+    if let Some(t) = a.frame_at {
+        let out = a.output.unwrap_or_else(|| {
+            let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            input.with_file_name(format!("{stem}-{t}s-sorted.png"))
+        });
+        imageio::save(&out, w, h, &sort(video::frame_at(input, &info, t)?), None)?;
+        if !a.quiet {
+            eprintln!("pixlflow: frame at {t} s -> {}", out.display());
+        }
+        return Ok(());
+    }
+    let sink = if a.play {
+        video::Sink::Player
+    } else {
+        let out = a.output.clone().unwrap_or_else(|| default_output(input));
+        if out == std::path::Path::new("-") || input == out {
+            return Err("give a video file name to write to (stdout and the input itself are not allowed)".into());
+        }
+        video::Sink::File { out, streams_from: input.to_path_buf() }
+    };
+    let started = Instant::now();
+    let total = info.frames.max(1);
+    let n = video::run(input, &info, &sink, |_, px| sort(px), |i| {
+        if !a.quiet && i % 5 == 0 {
+            eprint!("\rpixlflow: frame {i} / {total} ({:.1} s)   ", i as f64 / info.fps);
+        }
+        true
+    })?;
+    if !a.quiet {
+        let place = match &sink {
+            video::Sink::File { out, .. } => out.display().to_string(),
+            video::Sink::Player => "player".into(),
+        };
+        eprintln!("\rpixlflow: {n} frames ({w}x{h}) in {:.1} s -> {place}", started.elapsed().as_secs_f64());
     }
     Ok(())
 }
@@ -170,6 +239,11 @@ Options:
   --mask FILE          grey mask, same size as INPUT: black = untouched, white = full effect
   --guide FILE         guide image for '--by guide' (resized to INPUT)
   --show-mask          write the threshold selection map instead of sorting
+
+Video (INPUT .mp4 .mov .mkv .webm .avi .m4v; needs ffmpeg, ffprobe and ffplay next to
+pixlflow.exe or in PATH). Every frame is sorted; audio and subtitles are copied as they are.
+  --play               watch the sorted video instead of writing a file
+  --frame-at SECONDS   sort only the frame at that time and write it as an image
   -q, --quiet          no messages
   -h, --help           this help
   -V, --version        version

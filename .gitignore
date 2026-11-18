@@ -1,2 +1,5 @@
 /target
 *.md
+!README.md
+!README.ru.md
+/CRATE-LICENSES.txt

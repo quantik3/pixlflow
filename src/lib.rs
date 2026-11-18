@@ -11,6 +11,7 @@ pub mod paths;
 pub mod project;
 pub mod select;
 pub mod settings;
+pub mod video;
 
 use rayon::prelude::*;
 

@@ -4,7 +4,7 @@ use super::worker::{render_layer, Layer};
 use eframe::egui;
 use image::codecs::gif::{GifEncoder, Repeat};
 use image::{Delay, Frame, RgbaImage};
-use pixlflow::{anim, imageio, settings::Settings, Rgb};
+use pixlflow::{anim, imageio, settings::Settings, video, Rgb};
 use std::fs::File;
 use std::io::BufWriter;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -36,6 +36,7 @@ pub struct Export {
     pub done: Arc<AtomicUsize>,
     pub total: usize,
     pub stop: Arc<AtomicBool>,
+    pub started: std::time::Instant,
     result: mpsc::Receiver<Result<String, String>>,
 }
 
@@ -46,18 +47,62 @@ impl Export {
     }
 }
 
-pub fn start(ctx: egui::Context, frames: Frames, target: Target) -> Export {
+/// Runs `job(done, stop)` on its own thread; a panic becomes an error message.
+fn spawn_job(
+    ctx: egui::Context,
+    total: usize,
+    job: impl FnOnce(&AtomicUsize, &AtomicBool) -> Result<String, String> + Send + 'static,
+) -> Export {
     let (done, stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
     let (tx, result) = mpsc::channel();
-    let total = frames.times.len();
     let (d, s) = (done.clone(), stop.clone());
     std::thread::spawn(move || {
-        let r = catch_unwind(AssertUnwindSafe(|| run(&frames, &target, &d, &s)))
-            .unwrap_or_else(|_| Err("Export failed with an internal error.".into()));
+        let r = catch_unwind(AssertUnwindSafe(|| job(&d, &s))).unwrap_or_else(|_| Err("The job failed with an internal error.".into()));
         let _ = tx.send(r);
         ctx.request_repaint();
     });
-    Export { done, total, stop, result }
+    Export { done, total, stop, started: std::time::Instant::now(), result }
+}
+
+pub fn start(ctx: egui::Context, frames: Frames, target: Target) -> Export {
+    spawn_job(ctx, frames.times.len(), move |done, stop| run(&frames, &target, done, stop))
+}
+
+/// A whole video through the layer stack, optionally animating layer `cur` from its start to its end.
+pub struct VideoJob {
+    pub input: PathBuf,
+    pub info: video::Info,
+    pub layers: Vec<Layer>,
+    pub cur: usize,
+    pub anim: Option<(Settings, Settings, anim::Ease)>,
+}
+
+impl VideoJob {
+    fn frame(&self, i: usize, px: Vec<Rgb>) -> Vec<Rgb> {
+        let (w, h) = (self.info.w, self.info.h);
+        let last = (self.info.frames.max(2) - 1) as f32;
+        self.layers.iter().enumerate().fold(px, |img, (k, l)| match &self.anim {
+            Some((a, b, ease)) if k == self.cur => {
+                let moving = Layer { s: anim::lerp(a, b, ease.apply(i as f32 / last)), ..l.clone() };
+                render_layer(&moving, w, h, &img, (w, h))
+            }
+            _ => render_layer(l, w, h, &img, (w, h)),
+        })
+    }
+}
+
+/// Writes the sorted video to a file, or plays it (`Sink::Player`, finishes without a message).
+pub fn start_video(ctx: egui::Context, job: VideoJob, sink: video::Sink) -> Export {
+    spawn_job(ctx, job.info.frames as usize, move |done, stop| {
+        let n = video::run(&job.input, &job.info, &sink, |i, px| job.frame(i, px), |i| {
+            done.store(i, Relaxed);
+            !stop.load(Relaxed)
+        })?;
+        Ok(match &sink {
+            video::Sink::File { out, .. } => format!("Exported {n} frames to {}.", out.display()),
+            video::Sink::Player => String::new(),
+        })
+    })
 }
 
 fn run(f: &Frames, target: &Target, done: &AtomicUsize, stop: &AtomicBool) -> Result<String, String> {

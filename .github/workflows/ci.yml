@@ -1,9 +1,33 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 jobs:
   test:
     runs-on: windows-latest # the GUI is built for Windows only (no x11/wayland features)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+      - run: cargo test # debug build: integer overflow fails; the video test skips without FFmpeg
+
+  windows-build:
+    # Windows release: the exe with its license notices (FFmpeg is not bundled; users install it)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo install cargo-about --locked --features cli
+      - run: cargo about generate about.hbs -o CRATE-LICENSES.txt
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pixlflow | Out-Null
+          Copy-Item target/release/pixlflow.exe, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.txt, CRATE-LICENSES.txt pixlflow/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixlflow-windows
+          path: pixlflow/

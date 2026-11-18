@@ -12,7 +12,7 @@ use pixlflow::{
     engine, imageio,
     project::{Project, ProjectLayer},
     settings::Settings,
-    Rgb, Rng,
+    video, Rgb, Rng,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +38,8 @@ pub fn run(settings: Settings, input: Option<PathBuf>, output: Option<PathBuf>) 
         "Pixlflow",
         options,
         Box::new(move |cc| {
+            // dark everywhere, matching the neutral dark backdrop behind the image
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
             let mut app = App::new(cc.egui_ctx.clone(), settings, output);
             if let Some(p) = input {
                 app.open(&cc.egui_ctx, &p);
@@ -106,7 +108,15 @@ struct Anim {
     /// Moment shown by the Try slider, 0–1.
     try_t: f32,
     gif_side: usize,
-    export: Option<export::Export>,
+}
+
+/// The opened video (the document shows one of its frames).
+struct VideoDoc {
+    info: video::Info,
+    /// Time of the frame being edited, seconds.
+    t: f64,
+    /// Export animates the current layer from Start to End over the clip.
+    animate: bool,
 }
 
 pub struct App {
@@ -145,6 +155,9 @@ pub struct App {
     preset_text: String,
     rng: Rng,
     anim: Anim,
+    video: Option<VideoDoc>,
+    /// Background animation export, video export or video playback.
+    job: Option<export::Export>,
 }
 
 impl App {
@@ -182,7 +195,9 @@ impl App {
             preset_name: String::new(),
             preset_text: String::new(),
             rng: Rng::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)),
-            anim: Anim { start: None, end: None, frames: 30, fps: 15, ping_pong: false, ease: Ease::Linear, try_t: 0.0, gif_side: 600, export: None },
+            anim: Anim { start: None, end: None, frames: 30, fps: 15, ping_pong: false, ease: Ease::Linear, try_t: 0.0, gif_side: 600 },
+            video: None,
+            job: None,
         }
     }
 
@@ -190,10 +205,12 @@ impl App {
         &mut self.layers[self.cur]
     }
 
-    /// Opens an image or a project file.
+    /// Opens an image, a video or a project file.
     fn open(&mut self, ctx: &egui::Context, path: &Path) {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT)) {
             self.open_project(ctx, path);
+        } else if video::is_video(path) {
+            self.open_video(ctx, path);
         } else {
             self.open_image(ctx, path);
         }
@@ -210,13 +227,44 @@ impl App {
         if pic.deep {
             self.message = Some("The image has more than 8 bits per channel; it was reduced to 8 bits.".into());
         }
+        self.video = None;
+        self.set_doc(ctx, path, pic);
+        true
+    }
+
+    /// A video opens on its first frame; that frame is edited like an image.
+    fn open_video(&mut self, ctx: &egui::Context, path: &Path) -> bool {
+        let opened = video::probe(path).and_then(|info| video::frame_at(path, &info, 0.0).map(|px| (info, px)));
+        match opened {
+            Ok((info, rgb)) => {
+                self.set_doc(ctx, path, imageio::Picture { w: info.w, h: info.h, rgb, alpha: None, deep: false });
+                self.video = Some(VideoDoc { info, t: 0.0, animate: false });
+                true
+            }
+            Err(e) => {
+                self.message = Some(e);
+                false
+            }
+        }
+    }
+
+    /// Shows the video frame at `t` seconds, keeping every layer's masks and directions.
+    fn show_video_frame(&mut self, t: f64) {
+        let (Some(doc), Some(v)) = (&mut self.doc, &self.video) else { return };
+        match video::frame_at(&doc.path, &v.info, t) {
+            Ok(rgb) => {
+                doc.orig_tex.set(color_image(doc.w, doc.h, &rgb, None), tex_options());
+                doc.small = small_copy(doc.w, doc.h, &rgb);
+                doc.src = Arc::new(rgb);
+                self.cache.clear();
+                self.requested = None;
+            }
+            Err(e) => self.message = Some(e),
+        }
+    }
+
+    fn set_doc(&mut self, ctx: &egui::Context, path: &Path, pic: imageio::Picture) {
         let (w, h) = (pic.w, pic.h);
-        let long = w.max(h);
-        let small = (long > PREVIEW_SIDE).then(|| {
-            let k = PREVIEW_SIDE as f32 / long as f32;
-            let (sw, sh) = (((w as f32 * k).round() as usize).max(1), ((h as f32 * k).round() as usize).max(1));
-            Small { w: sw, h: sh, src: Arc::new(imageio::resize_rgb(&pic.rgb, w, h, sw, sh)) }
-        });
         let image = color_image(w, h, &pic.rgb, pic.alpha.as_deref());
         self.doc = Some(Doc {
             path: path.to_path_buf(),
@@ -224,9 +272,9 @@ impl App {
             h,
             orig_tex: ctx.load_texture("original", image.clone(), tex_options()),
             result_tex: ctx.load_texture("result", image, tex_options()),
+            small: small_copy(w, h, &pic.rgb),
             src: Arc::new(pic.rgb),
             alpha: pic.alpha,
-            small,
             overlay: None,
         });
         // masks, guides and directions belong to the previous image; settings stay
@@ -240,7 +288,6 @@ impl App {
         self.shown_id = self.next_id; // drop results still coming for the previous image
         self.requested = None;
         self.view.fit_pending = true;
-        true
     }
 
     fn open_project(&mut self, ctx: &egui::Context, path: &Path) {
@@ -255,7 +302,8 @@ impl App {
         let Some(image) = [Some(saved.clone()), beside].into_iter().flatten().find(|p| p.is_file()) else {
             return self.message = Some(format!("The project's image '{}' was not found, not even next to the project.", saved.display()));
         };
-        if !self.open_image(ctx, &image) {
+        let opened = if video::is_video(&image) { self.open_video(ctx, &image) } else { self.open_image(ctx, &image) };
+        if !opened {
             return;
         }
         let doc = self.doc.as_ref().expect("image just opened");
@@ -367,15 +415,49 @@ impl App {
             end,
             times: anim::frame_times(self.anim.frames, self.anim.ping_pong, self.anim.ease),
         };
-        self.anim.export = Some(export::start(ctx.clone(), frames, target));
+        self.job = Some(export::start(ctx.clone(), frames, target));
+    }
+
+    /// Plays the video sorted by the whole layer stack, or writes it to a file chosen in a dialog.
+    fn start_video(&mut self, ctx: &egui::Context, play: bool) {
+        let (Some(doc), Some(v)) = (&self.doc, &self.video) else { return };
+        let sink = if play {
+            video::Sink::Player
+        } else {
+            let (stem, _) = stem_ext(&doc.path);
+            let ext = doc.path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_else(|| "mp4".into());
+            let mut d = rfd::FileDialog::new()
+                .set_file_name(format!("{stem}-sorted.{ext}"))
+                .add_filter("MP4", &["mp4"])
+                .add_filter("Matroska", &["mkv"])
+                .add_filter("WebM", &["webm"])
+                .add_filter("QuickTime", &["mov"]);
+            if let Some(dir) = self.out_dir.as_deref().or(doc.path.parent()) {
+                d = d.set_directory(dir);
+            }
+            let Some(out) = d.save_file() else { return };
+            if out == doc.path {
+                return self.message = Some("Choose a new file: the video can't overwrite itself.".into());
+            }
+            video::Sink::File { out, streams_from: doc.path.clone() }
+        };
+        let anim = match (v.animate, &self.anim.start, &self.anim.end) {
+            (true, Some(a), Some(b)) => Some((a.clone(), b.clone(), self.anim.ease)),
+            _ => None,
+        };
+        let job = export::VideoJob { input: doc.path.clone(), info: v.info.clone(), layers: self.layers.clone(), cur: self.cur, anim };
+        self.job = Some(export::start_video(ctx.clone(), job, sink));
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
-        let Some(ex) = &self.anim.export else { return };
+        let Some(ex) = &self.job else { return };
         match ex.finished() {
             Some(r) => {
-                self.message = Some(r.unwrap_or_else(|e| e));
-                self.anim.export = None;
+                let text = r.unwrap_or_else(|e| e);
+                if !text.is_empty() {
+                    self.message = Some(text);
+                }
+                self.job = None;
             }
             None => ctx.request_repaint_after(Duration::from_millis(100)), // keep the progress bar moving
         }
@@ -578,7 +660,7 @@ impl App {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let dialog = rfd::FileDialog::new()
-            .add_filter("Images and projects", &[&IMAGE_EXTS[..], &[PROJECT_EXT]].concat())
+            .add_filter("Images, videos and projects", &[&IMAGE_EXTS[..], &video::VIDEO_EXTS[..6], &[PROJECT_EXT]].concat())
             .add_filter("Pixlflow project", &[PROJECT_EXT]);
         if let Some(p) = dialog.pick_file() {
             self.open(ctx, &p);
@@ -810,6 +892,16 @@ impl eframe::App for App {
         self.commit_undo(&ctx);
         self.request_sort(&ctx);
     }
+}
+
+/// Downscaled copy for fast previews, for images with a long side over `PREVIEW_SIDE`.
+fn small_copy(w: usize, h: usize, rgb: &[Rgb]) -> Option<Small> {
+    let long = w.max(h);
+    (long > PREVIEW_SIDE).then(|| {
+        let k = PREVIEW_SIDE as f32 / long as f32;
+        let (sw, sh) = (((w as f32 * k).round() as usize).max(1), ((h as f32 * k).round() as usize).max(1));
+        Small { w: sw, h: sh, src: Arc::new(imageio::resize_rgb(rgb, w, h, sw, sh)) }
+    })
 }
 
 fn tex_options() -> TextureOptions {

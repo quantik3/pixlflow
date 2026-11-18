@@ -72,13 +72,22 @@ impl App {
             }
         });
         ui.separator();
+        if self.video.is_some() {
+            self.video_section(ui);
+        }
         self.layer_list(ui);
         ui.add_space(4.0);
 
         section(ui, "Layer", |ui| {
             let s = &mut self.layers[self.cur].s;
             row(ui, "Blend", |ui| combo(ui, "blend", &mut s.blend, BlendMode::ALL.iter().copied(), BlendMode::name));
-            row(ui, "Opacity", |ui| ui.add(Slider::new(&mut s.opacity, 0.0..=1.0)));
+            row(ui, "Opacity", |ui| {
+                ui.add(
+                    Slider::new(&mut s.opacity, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)),
+                )
+            });
         });
         section(ui, "Path", |ui| self.path_rows(ui));
         section(ui, "Selection", |ui| selection_rows(ui, &mut self.layers[self.cur].s));
@@ -174,32 +183,57 @@ impl App {
                 }
                 row(ui, "GIF size", |ui| ui.add(Slider::new(&mut a.gif_side, 100..=2000).logarithmic(true).suffix(" px")).on_hover_text("Longest side"));
             });
-            match &a.export {
-                Some(ex) => {
-                    ui.horizontal(|ui| {
-                        let done = ex.done.load(std::sync::atomic::Ordering::Relaxed);
-                        ui.add(egui::ProgressBar::new(done as f32 / ex.total as f32).text(format!("{done} / {}", ex.total)).desired_width(200.0));
-                        if ui.button("Stop").clicked() {
-                            ex.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    });
-                }
-                None => {
-                    let ready = a.start.is_some() && a.end.is_some() && self.doc.is_some();
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(ready, Button::new("Export GIF…")).clicked() {
-                            export = Some(true);
-                        }
-                        if ui.add_enabled(ready, Button::new("Export PNG frames…")).clicked() {
-                            export = Some(false);
-                        }
-                    });
-                }
+            if !job_progress(ui, &self.job, None) {
+                let ready = a.start.is_some() && a.end.is_some() && self.doc.is_some();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(ready, Button::new("Export GIF…")).clicked() {
+                        export = Some(true);
+                    }
+                    if ui.add_enabled(ready, Button::new("Export PNG frames…")).clicked() {
+                        export = Some(false);
+                    }
+                });
             }
         });
         if let Some(gif) = export {
             let ctx = ui.ctx().clone();
             self.start_export(&ctx, gif);
+        }
+    }
+
+    fn video_section(&mut self, ui: &mut Ui) {
+        let (mut seek, mut start) = (None, None);
+        let anim_ready = self.anim.start.is_some() && self.anim.end.is_some();
+        egui::CollapsingHeader::new(RichText::new("Video").strong()).default_open(true).show(ui, |ui| {
+            let Some(v) = &mut self.video else { return };
+            let i = &v.info;
+            ui.label(format!("{} × {}, {} frames, {:.2} fps, {:.1} s", i.w, i.h, i.frames, i.fps, i.duration));
+            ui.horizontal(|ui| {
+                ui.label("Frame at").on_hover_text("The frame you edit with layers and masks");
+                let r = ui.add(Slider::new(&mut v.t, 0.0..=i.duration.max(0.0)).suffix(" s").max_decimals(2));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    seek = Some(v.t);
+                }
+            });
+            ui.add_enabled(anim_ready, egui::Checkbox::new(&mut v.animate, "Animate this layer over the clip"))
+                .on_hover_text("From Start to End (see Animation)");
+            if !job_progress(ui, &self.job, Some(v.info.fps)) {
+                ui.horizontal(|ui| {
+                    if ui.button("Play sorted").on_hover_text("Watch in a player window, sorted live").clicked() {
+                        start = Some(true);
+                    }
+                    if ui.button("Export video…").on_hover_text("All layers; sound is copied").clicked() {
+                        start = Some(false);
+                    }
+                });
+            }
+        });
+        if let Some(t) = seek {
+            self.show_video_frame(t);
+        }
+        if let Some(play) = start {
+            let ctx = ui.ctx().clone();
+            self.start_video(&ctx, play);
         }
     }
 
@@ -345,12 +379,17 @@ impl App {
         row(ui, "Posterize", |ui| ui.add(Slider::new(&mut s.posterize, 0..=32)).on_hover_text("Levels per channel, 0 = off"));
         row(ui, "Soft ends", |ui| ui.add(Slider::new(&mut s.soft_ends, 0..=200).suffix(" px")));
         row(ui, "Fringes", |ui| ui.add(Slider::new(&mut s.fringes, -50..=50).suffix(" px")));
-        row(ui, "Target", |ui| {
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut s.target).on_hover_text("Color for the Distance criterion");
-                pick_button(ui, &mut self.pick, Pick::Color, "Pick on image");
-            })
-        });
+        let threshold = matches!(s.select, K::Threshold | K::Combined);
+        let distance = Criterion::ColorDistance;
+        let uses_target = s.by == distance || (threshold && s.crit == distance) || (s.select == K::Combined && s.crit2 == distance);
+        if uses_target {
+            row(ui, "Target", |ui| {
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut s.target).on_hover_text("Color for the Distance criterion");
+                    pick_button(ui, &mut self.pick, Pick::Color, "Pick on image");
+                })
+            });
+        }
         let l = &self.layers[self.cur];
         let guide = l.guide.as_ref().map(|_| l.guide_name.clone().unwrap_or_default());
         let has_doc = self.doc.is_some();
@@ -428,6 +467,27 @@ fn sorting_rows(ui: &mut Ui, s: &mut Settings) {
     }
 }
 
+/// Progress bar with Stop for a running background job; false when there is none.
+/// With `fps` (video) the bar also shows the time reached.
+fn job_progress(ui: &mut Ui, job: &Option<super::export::Export>, fps: Option<f64>) -> bool {
+    let Some(ex) = job else { return false };
+    ui.horizontal(|ui| {
+        let done = ex.done.load(std::sync::atomic::Ordering::Relaxed);
+        let frac = if ex.total > 0 { done as f32 / ex.total as f32 } else { 0.0 };
+        let mut text = format!("frame {done} / {}", ex.total);
+        if let Some(fps) = fps.filter(|f| *f > 0.0) {
+            text += &format!(" · at {:.1} s", done as f64 / fps); // position in the video
+        }
+        let secs = ex.started.elapsed().as_secs();
+        text += &format!(" · {}:{:02} elapsed", secs / 60, secs % 60);
+        ui.add(egui::ProgressBar::new(frac).text(text).desired_width(ui.available_width() - 60.0));
+        if ui.button("Stop").clicked() {
+            ex.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    true
+}
+
 fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong()).default_open(true).show(ui, |ui| {
         egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).min_col_width(80.0).show(ui, add);
@@ -457,7 +517,7 @@ fn combo<T: Copy + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, all: impl It
 
 fn pick_button(ui: &mut Ui, pick: &mut Option<Pick>, which: Pick, text: &str) {
     let on = *pick == Some(which);
-    if ui.selectable_label(on, text).clicked() {
+    if ui.add(Button::new(text).selected(on)).on_hover_text("Then click the image").clicked() {
         *pick = if on { None } else { Some(which) };
     }
 }
