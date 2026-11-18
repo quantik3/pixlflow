@@ -1,11 +1,19 @@
 //! The window: settings panel on the left, image on the right, status bar below.
 
+mod export;
 mod panel;
+mod presets;
 mod view;
 mod worker;
 
 use eframe::egui::{self, Color32, ColorImage, Key, Modifiers, TextureHandle, TextureOptions};
-use pixlflow::{engine, imageio, settings::Settings, Rgb};
+use pixlflow::{
+    anim::{self, Ease},
+    engine, imageio,
+    project::{Project, ProjectLayer},
+    settings::Settings,
+    Rgb, Rng,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +23,7 @@ const PANEL_WIDTH: f32 = 380.0;
 const PREVIEW_SIDE: usize = 1000;
 const UNDO_STEPS: usize = 40;
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+const PROJECT_EXT: &str = "pxlf";
 
 pub fn run(settings: Settings, input: Option<PathBuf>, output: Option<PathBuf>) -> Result<(), String> {
     let options = eframe::NativeOptions {
@@ -86,6 +95,20 @@ struct Brush {
 /// Layers plus the current layer index.
 type Snapshot = (Vec<Layer>, usize);
 
+/// Animation of the current layer between two settings.
+struct Anim {
+    start: Option<Settings>,
+    end: Option<Settings>,
+    frames: usize,
+    fps: u32,
+    ping_pong: bool,
+    ease: Ease,
+    /// Moment shown by the Try slider, 0–1.
+    try_t: f32,
+    gif_side: usize,
+    export: Option<export::Export>,
+}
+
 pub struct App {
     layers: Vec<Layer>,
     cur: usize,
@@ -116,6 +139,12 @@ pub struct App {
     sort_ms: Option<u128>,
     saved_at: Option<Instant>,
     message: Option<String>,
+    presets: Vec<(String, String)>,
+    preset_pick: Option<usize>,
+    preset_name: String,
+    preset_text: String,
+    rng: Rng,
+    anim: Anim,
 }
 
 impl App {
@@ -148,6 +177,12 @@ impl App {
             sort_ms: None,
             saved_at: None,
             message: None,
+            presets: presets::load(),
+            preset_pick: None,
+            preset_name: String::new(),
+            preset_text: String::new(),
+            rng: Rng::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)),
+            anim: Anim { start: None, end: None, frames: 30, fps: 15, ping_pong: false, ease: Ease::Linear, try_t: 0.0, gif_side: 600, export: None },
         }
     }
 
@@ -155,10 +190,22 @@ impl App {
         &mut self.layers[self.cur]
     }
 
+    /// Opens an image or a project file.
     fn open(&mut self, ctx: &egui::Context, path: &Path) {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT)) {
+            self.open_project(ctx, path);
+        } else {
+            self.open_image(ctx, path);
+        }
+    }
+
+    fn open_image(&mut self, ctx: &egui::Context, path: &Path) -> bool {
         let pic = match imageio::load(path) {
             Ok(p) => p,
-            Err(e) => return self.message = Some(e),
+            Err(e) => {
+                self.message = Some(e);
+                return false;
+            }
         };
         if pic.deep {
             self.message = Some("The image has more than 8 bits per channel; it was reduced to 8 bits.".into());
@@ -193,6 +240,145 @@ impl App {
         self.shown_id = self.next_id; // drop results still coming for the previous image
         self.requested = None;
         self.view.fit_pending = true;
+        true
+    }
+
+    fn open_project(&mut self, ctx: &egui::Context, path: &Path) {
+        let read = std::fs::read(path).map_err(|e| format!("cannot open '{}': {e}", path.display()));
+        let mut proj = match read.and_then(|b| Project::from_bytes(&b)) {
+            Ok(p) => p,
+            Err(e) => return self.message = Some(format!("{e}: {}", path.display())),
+        };
+        // the image may have moved together with the project
+        let saved = PathBuf::from(&proj.image);
+        let beside = saved.file_name().and_then(|n| path.parent().map(|d| d.join(n)));
+        let Some(image) = [Some(saved.clone()), beside].into_iter().flatten().find(|p| p.is_file()) else {
+            return self.message = Some(format!("The project's image '{}' was not found, not even next to the project.", saved.display()));
+        };
+        if !self.open_image(ctx, &image) {
+            return;
+        }
+        let doc = self.doc.as_ref().expect("image just opened");
+        proj.fit(doc.w, doc.h);
+        self.layers = proj
+            .layers
+            .into_iter()
+            .map(|l| Layer {
+                s: l.settings,
+                mask: l.mask.map(Arc::new),
+                guide: l.guide.map(Arc::new),
+                guide_name: l.guide_name,
+                dirs: l.dirs.map(Arc::new),
+            })
+            .collect();
+        self.cur = proj.current;
+        self.committed = self.layers.clone();
+    }
+
+    fn save_project(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let (stem, _) = stem_ext(&doc.path);
+        let mut dialog = rfd::FileDialog::new().set_file_name(format!("{stem}.{PROJECT_EXT}")).add_filter("Pixlflow project", &[PROJECT_EXT]);
+        if let Some(dir) = doc.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else { return };
+        let proj = Project {
+            image: std::path::absolute(&doc.path).unwrap_or_else(|_| doc.path.clone()).to_string_lossy().into_owned(),
+            current: self.cur,
+            layers: self
+                .layers
+                .iter()
+                .map(|l| ProjectLayer {
+                    settings: l.s.clone(),
+                    mask: l.mask.as_deref().cloned(),
+                    guide: l.guide.as_deref().cloned(),
+                    guide_name: l.guide_name.clone(),
+                    dirs: l.dirs.as_deref().cloned(),
+                })
+                .collect(),
+        };
+        match std::fs::write(&path, proj.to_bytes()) {
+            Ok(()) => self.saved_at = Some(Instant::now()),
+            Err(e) => self.message = Some(format!("cannot save '{}': {e}", path.display())),
+        }
+    }
+
+    // ---- presets and animation ----
+
+    fn save_preset(&mut self) {
+        let name = presets::clean_name(&self.preset_name);
+        let text = self.layers[self.cur].s.to_preset();
+        match self.presets.iter_mut().find(|(n, _)| *n == name) {
+            Some(p) => p.1 = text,
+            None => self.presets.push((name.clone(), text)),
+        }
+        self.preset_pick = self.presets.iter().position(|(n, _)| *n == name);
+        if let Err(e) = presets::save(&self.presets) {
+            self.message = Some(e);
+        }
+    }
+
+    fn delete_preset(&mut self, i: usize) {
+        self.presets.remove(i);
+        self.preset_pick = None;
+        if let Err(e) = presets::save(&self.presets) {
+            self.message = Some(e);
+        }
+    }
+
+    /// Replaces the current layer's settings with preset text (missing keys take defaults).
+    fn apply_preset_text(&mut self, text: &str) {
+        match Settings::from_preset(text) {
+            Ok(s) => self.layer().s = s,
+            Err(e) => self.message = Some(format!("Preset not applied: {e}")),
+        }
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context, gif: bool) {
+        let (Some(start), Some(end), Some(doc)) = (self.anim.start.clone(), self.anim.end.clone(), &self.doc) else { return };
+        let (stem, _) = stem_ext(&doc.path);
+        let dir = self.out_dir.clone().or_else(|| doc.path.parent().map(Path::to_path_buf));
+        let target = if gif {
+            let mut d = rfd::FileDialog::new().set_file_name(format!("{stem}-anim.gif")).add_filter("GIF", &["gif"]);
+            if let Some(dir) = &dir {
+                d = d.set_directory(dir);
+            }
+            let Some(path) = d.save_file() else { return };
+            export::Target::Gif { path, side: self.anim.gif_side, fps: self.anim.fps }
+        } else {
+            let mut d = rfd::FileDialog::new();
+            if let Some(dir) = &dir {
+                d = d.set_directory(dir);
+            }
+            let Some(dir) = d.pick_folder() else { return };
+            export::Target::Png { dir, stem }
+        };
+        let (w, h, alpha) = (doc.w, doc.h, doc.alpha.clone());
+        let Some(below) = self.chain(self.cur) else { return }; // layers below the animated one: sorted once
+        let frames = export::Frames {
+            below,
+            w,
+            h,
+            alpha,
+            layer: self.layers[self.cur].clone(),
+            above: self.layers[self.cur + 1..].to_vec(),
+            start,
+            end,
+            times: anim::frame_times(self.anim.frames, self.anim.ping_pong, self.anim.ease),
+        };
+        self.anim.export = Some(export::start(ctx.clone(), frames, target));
+    }
+
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        let Some(ex) = &self.anim.export else { return };
+        match ex.finished() {
+            Some(r) => {
+                self.message = Some(r.unwrap_or_else(|e| e));
+                self.anim.export = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(100)), // keep the progress bar moving
+        }
     }
 
     fn load_guide(&mut self, path: &Path) {
@@ -391,7 +577,10 @@ impl App {
     // ---- files ----
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Images", &IMAGE_EXTS).pick_file() {
+        let dialog = rfd::FileDialog::new()
+            .add_filter("Images and projects", &[&IMAGE_EXTS[..], &[PROJECT_EXT]].concat())
+            .add_filter("Pixlflow project", &[PROJECT_EXT]);
+        if let Some(p) = dialog.pick_file() {
             self.open(ctx, &p);
         }
     }
@@ -609,6 +798,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.receive();
+        self.poll_export(&ctx);
         self.dropped_files(&ctx);
         self.hotkeys(&ctx);
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));

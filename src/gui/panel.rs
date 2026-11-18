@@ -1,8 +1,9 @@
 //! The settings panel (fixed width, vertical scroll only).
 
-use super::{App, MaskAction, Pick, Tool};
+use super::{presets, App, MaskAction, Pick, Tool};
 use eframe::egui::{self, pos2, vec2, Button, Color32, DragValue, Rect, RichText, Sense, Slider, Ui};
 use pixlflow::{
+    anim::{self, Ease},
     color,
     settings::{Algorithm, BlendMode, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
     Rgb,
@@ -24,6 +25,9 @@ impl App {
             }
             if ui.add_enabled(has_doc, Button::new("Save as…")).on_hover_text("Ctrl+Shift+S").clicked() {
                 self.save_as();
+            }
+            if ui.add_enabled(has_doc, Button::new("Save project…")).on_hover_text("All layers, masks and directions").clicked() {
+                self.save_project();
             }
         });
         ui.horizontal(|ui| {
@@ -81,6 +85,122 @@ impl App {
         section(ui, "Sorting", |ui| sorting_rows(ui, &mut self.layers[self.cur].s));
         section(ui, "Extras", |ui| self.extra_rows(ui));
         self.brush_section(ui);
+        self.preset_section(ui);
+        self.anim_section(ui);
+    }
+
+    fn preset_section(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new(RichText::new("Presets").strong()).show(ui, |ui| {
+            let picked = self.preset_pick.and_then(|i| self.presets.get(i)).map(|(n, _)| n.clone());
+            let (mut apply, mut delete, mut save, mut random, mut paste) = (false, false, false, false, false);
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("presets").selected_text(picked.as_deref().unwrap_or("Saved presets")).width(170.0).show_ui(ui, |ui| {
+                    for (i, (name, _)) in self.presets.iter().enumerate() {
+                        ui.selectable_value(&mut self.preset_pick, Some(i), name);
+                    }
+                });
+                apply = ui.add_enabled(picked.is_some(), Button::new("Apply")).clicked();
+                delete = ui.add_enabled(picked.is_some(), Button::new("Delete")).clicked();
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Name").desired_width(170.0));
+                save = ui.add_enabled(!presets::clean_name(&self.preset_name).is_empty(), Button::new("Save")).on_hover_text("Same name replaces").clicked();
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Copy as text").clicked() {
+                    ui.ctx().copy_text(self.layers[self.cur].s.to_preset());
+                }
+                random = ui.button("Random").on_hover_text("Random look for this layer").clicked();
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.preset_text).hint_text("Paste preset text").desired_width(170.0));
+                paste = ui.add_enabled(!self.preset_text.trim().is_empty(), Button::new("Apply text")).clicked();
+            });
+            if apply {
+                let text = self.presets[self.preset_pick.unwrap()].1.clone();
+                self.apply_preset_text(&text);
+            }
+            if delete {
+                self.delete_preset(self.preset_pick.unwrap());
+            }
+            if save {
+                self.save_preset();
+            }
+            if paste {
+                let text = std::mem::take(&mut self.preset_text);
+                self.apply_preset_text(&text);
+            }
+            if random {
+                let s = &mut self.layers[self.cur].s;
+                // blending stays: random changes the look, not how the layer mixes in
+                *s = Settings { blend: s.blend, opacity: s.opacity, ..Settings::random(&mut self.rng) };
+            }
+        });
+    }
+
+    fn anim_section(&mut self, ui: &mut Ui) {
+        let mut export = None;
+        egui::CollapsingHeader::new(RichText::new("Animation").strong()).show(ui, |ui| {
+            let s = self.layers[self.cur].s.clone();
+            let a = &mut self.anim;
+            egui::Grid::new("anim").num_columns(2).spacing([10.0, 6.0]).min_col_width(80.0).show(ui, |ui| {
+                for (label, slot) in [("Start", &mut a.start), ("End", &mut a.end)] {
+                    row(ui, label, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Set").on_hover_text("Use this layer's current settings").clicked() {
+                                *slot = Some(s.clone());
+                            }
+                            ui.label(if slot.is_some() { "set" } else { "not set" });
+                        })
+                    });
+                }
+                row(ui, "Frames", |ui| ui.add(Slider::new(&mut a.frames, 2..=1000).logarithmic(true)));
+                row(ui, "FPS", |ui| ui.add(Slider::new(&mut a.fps, 1..=60)));
+                row(ui, "Ping-pong", |ui| ui.checkbox(&mut a.ping_pong, "").on_hover_text("Forward, then back"));
+                row(ui, "Speed", |ui| {
+                    egui::ComboBox::from_id_salt("ease").selected_text(a.ease.name()).width(180.0).show_ui(ui, |ui| {
+                        for e in Ease::ALL {
+                            ui.selectable_value(&mut a.ease, e, e.name());
+                        }
+                    })
+                });
+                let ready = a.start.is_some() && a.end.is_some();
+                let mut tried = false;
+                row(ui, "Try", |ui| tried = ui.add_enabled(ready, Slider::new(&mut a.try_t, 0.0..=1.0)).changed());
+                if tried {
+                    if let (Some(st), Some(en)) = (&a.start, &a.end) {
+                        self.layers[self.cur].s = anim::lerp(st, en, a.ease.apply(a.try_t));
+                    }
+                }
+                row(ui, "GIF size", |ui| ui.add(Slider::new(&mut a.gif_side, 100..=2000).logarithmic(true).suffix(" px")).on_hover_text("Longest side"));
+            });
+            match &a.export {
+                Some(ex) => {
+                    ui.horizontal(|ui| {
+                        let done = ex.done.load(std::sync::atomic::Ordering::Relaxed);
+                        ui.add(egui::ProgressBar::new(done as f32 / ex.total as f32).text(format!("{done} / {}", ex.total)).desired_width(200.0));
+                        if ui.button("Stop").clicked() {
+                            ex.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
+                None => {
+                    let ready = a.start.is_some() && a.end.is_some() && self.doc.is_some();
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(ready, Button::new("Export GIF…")).clicked() {
+                            export = Some(true);
+                        }
+                        if ui.add_enabled(ready, Button::new("Export PNG frames…")).clicked() {
+                            export = Some(false);
+                        }
+                    });
+                }
+            }
+        });
+        if let Some(gif) = export {
+            let ctx = ui.ctx().clone();
+            self.start_export(&ctx, gif);
+        }
     }
 
     fn layer_list(&mut self, ui: &mut Ui) {

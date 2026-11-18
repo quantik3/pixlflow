@@ -4,7 +4,7 @@
 //! The same keys are the command-line options (`--path circles`). Unknown keys are ignored when reading,
 //! missing keys keep their defaults.
 
-use crate::Rgb;
+use crate::{Rgb, Rng};
 
 /// A setting value that can be written to and read from preset text.
 pub trait Value: Sized {
@@ -281,6 +281,67 @@ impl Settings {
             wavelength: self.wavelength * k,
             noise_size: self.noise_size * k,
             ..self.clone()
+        }
+    }
+
+    /// Random look. Skips choices that need input to work: drawn paths, guide and colour-distance criteria.
+    pub fn random(rng: &mut Rng) -> Settings {
+        fn pick<T: Copy + PartialEq>(rng: &mut Rng, all: &[T], skip: &[T]) -> T {
+            loop {
+                let v = all[rng.below(all.len() as u64) as usize];
+                if !skip.contains(&v) {
+                    return v;
+                }
+            }
+        }
+        fn f(rng: &mut Rng, lo: f32, hi: f32) -> f32 {
+            lo + rng.f32() * (hi - lo)
+        }
+        fn n(rng: &mut Rng, lo: u32, hi: u32) -> u32 {
+            lo + rng.below((hi - lo + 1) as u64) as u32
+        }
+        let no_input = [Criterion::Guide, Criterion::ColorDistance];
+        let crit = pick(rng, Criterion::ALL, &no_input);
+        let crit2 = pick(rng, Criterion::ALL, &no_input);
+        let (top, top2) = (crate::color::max_value(crit) as u32, crate::color::max_value(crit2) as u32);
+        Settings {
+            path: pick(rng, PathKind::ALL, &[PathKind::Drawn]),
+            reverse: rng.below(2) == 1,
+            cx: f(rng, 0.2, 0.8),
+            cy: f(rng, 0.2, 0.8),
+            rotation: f(rng, -180.0, 180.0),
+            aspect: f(rng, 0.5, 2.0),
+            angle: f(rng, 0.0, 360.0),
+            amplitude: f(rng, 5.0, 80.0),
+            wavelength: f(rng, 50.0, 600.0),
+            wave_vertical: rng.below(2) == 1,
+            noise_size: f(rng, 40.0, 500.0),
+            swirls: n(rng, 1, 8),
+            contour_smooth: n(rng, 0, 24),
+            star_points: n(rng, 3, 12),
+            star_inner: f(rng, 0.2, 0.9),
+            tile: n(rng, 16, 256),
+            seed: rng.below(100_000),
+            select: pick(rng, SelectorKind::ALL, &[]),
+            length: n(rng, 10, 400),
+            max_length: n(rng, 10, 400),
+            crit,
+            min: n(rng, 0, top),
+            max: n(rng, 0, top),
+            crit2,
+            min2: n(rng, 0, top2),
+            max2: n(rng, 0, top2),
+            combine: pick(rng, Combine::ALL, &[]),
+            edge: n(rng, 30, 300),
+            smooth: n(rng, 0, 5),
+            by: pick(rng, Criterion::ALL, &no_input),
+            algo: pick(rng, Algorithm::ALL, &[Algorithm::Debug]),
+            passes: n(rng, 1, 100),
+            strength: f(rng, 0.1, 0.9),
+            buckets: n(rng, 2, 32),
+            alternate: rng.below(4) == 0,
+            channel: if rng.below(5) == 0 { pick(rng, Channel::ALL, &[Channel::All]) } else { Channel::All },
+            ..Settings::default()
         }
     }
 }

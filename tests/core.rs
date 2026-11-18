@@ -238,6 +238,69 @@ fn blend_modes() {
 }
 
 #[test]
+fn project_round_trips() {
+    use pixlflow::project::{Project, ProjectLayer};
+    let p = Project {
+        image: "C:/pics/фото 1.png".into(),
+        current: 1,
+        layers: vec![
+            ProjectLayer { settings: Settings { path: P::Star, opacity: 0.25, ..Default::default() }, mask: Some(vec![0, 9, 255]), ..Default::default() },
+            ProjectLayer {
+                settings: Settings::default(),
+                guide: Some(vec![1, 2, 3]),
+                guide_name: Some("g.png".into()),
+                dirs: Some(vec![f32::NAN, 1.5, -3.0]),
+                ..Default::default()
+            },
+        ],
+    };
+    let bytes = p.to_bytes();
+    let q = Project::from_bytes(&bytes).unwrap();
+    assert_eq!(q.to_bytes(), bytes); // NaN directions survive bit for bit
+    assert_eq!((q.image.as_str(), q.current, q.layers.len()), (p.image.as_str(), 1, 2));
+    assert_eq!(q.layers[0].settings, p.layers[0].settings);
+    assert_eq!(q.layers[1].guide_name.as_deref(), Some("g.png"));
+    assert!(Project::from_bytes(&bytes[..bytes.len() - 2]).is_err(), "truncated file is rejected");
+    assert!(Project::from_bytes(b"hello").is_err());
+    let mut fitted = q.clone();
+    fitted.fit(3, 1);
+    assert!(fitted.layers[0].mask.is_some() && fitted.layers[1].dirs.is_some());
+    fitted.fit(2, 2);
+    assert!(fitted.layers[0].mask.is_none() && fitted.layers[1].guide_name.is_none());
+}
+
+#[test]
+fn random_settings_need_no_input() {
+    let mut rng = Rng::new(5);
+    for _ in 0..300 {
+        let s = Settings::random(&mut rng);
+        assert!(s.path != P::Drawn && s.algo != A::Debug);
+        for c in [s.by, s.crit, s.crit2] {
+            assert!(c != Criterion::Guide && c != Criterion::ColorDistance);
+        }
+        assert_eq!(Settings::from_preset(&s.to_preset()).unwrap(), s);
+    }
+}
+
+#[test]
+fn animation_interpolates() {
+    use pixlflow::anim::{frame_times, lerp, Ease};
+    let a = Settings { cx: 0.1, passes: 10, path: P::Waves, amplitude: 5.0, algo: A::Sort, ..Default::default() };
+    let b = Settings { cx: 0.9, passes: 30, path: P::Waves, amplitude: 45.0, algo: A::Mirror, ..Default::default() };
+    assert_eq!(lerp(&a, &b, 0.0), a);
+    assert_eq!(lerp(&a, &b, 1.0), b);
+    let mid = lerp(&a, &b, 0.25);
+    assert!((mid.cx - 0.3).abs() < 1e-6 && mid.passes == 15 && mid.amplitude == 15.0 && mid.algo == A::Sort);
+    assert_eq!(lerp(&a, &b, 0.5).algo, A::Mirror);
+    // different path kinds: path parameters switch instead of moving
+    let c = Settings { path: P::Lines, ..b.clone() };
+    assert_eq!(lerp(&a, &c, 0.25).amplitude, 5.0);
+    assert_eq!(frame_times(3, true, Ease::Linear), vec![0.0, 0.5, 1.0, 0.5]);
+    assert_eq!(frame_times(4, false, Ease::In).len(), 4);
+    assert_eq!(Ease::InOut.apply(0.5), 0.5);
+}
+
+#[test]
 fn colour_values() {
     assert_eq!(color::hue([255, 0, 0]), 0);
     assert_eq!(color::hue([0, 255, 0]), 120);
