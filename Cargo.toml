@@ -5,12 +5,17 @@ edition = "2021"
 description = "Pixlflow - pixel sorter"
 
 [dependencies]
+# wgpu renderer: runs via DirectX 12 (with a software fallback) where OpenGL 2+ is missing
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "clipboard"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "rayon"] }
 rayon = "1"
+rfd = "0.18"
 
 # Tests run in the dev profile (overflow checks stay on); a little optimisation keeps them quick.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false

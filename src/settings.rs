@@ -249,4 +249,23 @@ impl Settings {
         s.apply_preset(text)?;
         Ok(s)
     }
+
+    /// Settings for the same look on an image scaled by `k`: lengths in pixels are scaled.
+    pub fn scaled(&self, k: f32) -> Settings {
+        // non-zero lengths stay at least 1 (max-length at least 2) so spans don't vanish
+        let px = |v: u32, min: u32| if v == 0 { 0 } else { ((v as f32 * k).round() as u32).max(min) };
+        Settings {
+            length: px(self.length, 1),
+            max_length: if self.max_length > 1 { px(self.max_length, 2) } else { self.max_length },
+            tile: px(self.tile, 1),
+            contour_smooth: px(self.contour_smooth, 0),
+            smooth: px(self.smooth, 0),
+            soft_ends: px(self.soft_ends, 0),
+            fringes: (self.fringes as f32 * k).round() as i32,
+            amplitude: self.amplitude * k,
+            wavelength: self.wavelength * k,
+            noise_size: self.noise_size * k,
+            ..self.clone()
+        }
+    }
 }

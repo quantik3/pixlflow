@@ -1,0 +1,280 @@
+//! The settings panel (fixed width, vertical scroll only).
+
+use super::{App, Pick};
+use eframe::egui::{self, pos2, vec2, Button, Color32, DragValue, Rect, RichText, Sense, Slider, Ui};
+use pixlflow::{
+    color,
+    settings::{Algorithm, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
+    Rgb,
+};
+
+impl App {
+    pub(super) fn settings_panel(&mut self, ui: &mut Ui) {
+        ui.spacing_mut().slider_width = 180.0;
+        let ctx = ui.ctx().clone();
+        let has_doc = self.doc.is_some();
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("Open…").on_hover_text("Ctrl+O").clicked() {
+                self.open_dialog(&ctx);
+            }
+            if ui.add_enabled(has_doc, Button::new("Save")).on_hover_text("Ctrl+S").clicked() {
+                self.save();
+            }
+            if ui.add_enabled(has_doc, Button::new("Save as…")).on_hover_text("Ctrl+Shift+S").clicked() {
+                self.save_as();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Save to:");
+            let place = match (&self.fixed_output, &self.out_dir) {
+                (Some(p), _) => p.display().to_string(),
+                (None, Some(d)) => d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                (None, None) => "next to the image".into(),
+            };
+            ui.add(egui::Label::new(place).truncate());
+            if self.fixed_output.is_none() {
+                if ui.small_button("Folder…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        self.out_dir = Some(d);
+                    }
+                }
+                if self.out_dir.is_some() && ui.small_button("Clear").on_hover_text("Next to the image").clicked() {
+                    self.out_dir = None;
+                }
+            }
+        });
+        ui.separator();
+
+        let sort = Button::new(RichText::new("SORT IMAGE").strong().size(16.0));
+        if ui.add_enabled(has_doc, sort).clicked() {
+            self.sort_now = true;
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.auto_sort, "Auto-sort");
+            ui.checkbox(&mut self.background, "Background");
+            ui.checkbox(&mut self.fast_preview, "Fast preview")
+                .on_hover_text("Sort a smaller copy while a slider is dragged");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.compare, "Compare");
+            ui.checkbox(&mut self.show_mask, "Show mask").on_hover_text("M: white where the threshold selects");
+            if ui.add_enabled(!self.undo.is_empty(), Button::new("Undo").small()).on_hover_text("Undo (Ctrl+Z)").clicked() {
+                self.undo();
+            }
+            if ui.add_enabled(!self.redo.is_empty(), Button::new("Redo").small()).on_hover_text("Redo (Ctrl+Y)").clicked() {
+                self.redo();
+            }
+        });
+        ui.add_space(4.0);
+
+        section(ui, "Path", |ui| self.path_rows(ui));
+        section(ui, "Selection", |ui| selection_rows(ui, &mut self.s));
+        section(ui, "Sorting", |ui| sorting_rows(ui, &mut self.s));
+        section(ui, "Extras", |ui| self.extra_rows(ui));
+    }
+
+    fn path_rows(&mut self, ui: &mut Ui) {
+        let s = &mut self.s;
+        row(ui, "Shape", |ui| combo(ui, "path", &mut s.path, P::ALL.iter().copied(), P::name));
+        row(ui, "Reverse", |ui| ui.checkbox(&mut s.reverse, ""));
+        if matches!(s.path, P::Rays | P::Circles | P::Spiral | P::SquareSpiral | P::RectSpiral | P::Star | P::Swirls) {
+            row(ui, "Center x", |ui| ui.add(Slider::new(&mut s.cx, 0.0..=1.0)));
+            row(ui, "Center y", |ui| ui.add(Slider::new(&mut s.cy, 0.0..=1.0)));
+            row(ui, "", |ui| pick_button(ui, &mut self.pick, Pick::Center, "Pick center on image"));
+        }
+        match s.path {
+            P::Circles | P::Spiral => {
+                row(ui, "Rotation", |ui| ui.add(Slider::new(&mut s.rotation, -180.0..=180.0).suffix("°")));
+                row(ui, "Aspect", |ui| ui.add(Slider::new(&mut s.aspect, 0.2..=5.0).logarithmic(true)));
+            }
+            P::Diagonal => {
+                row(ui, "Angle", |ui| ui.add(Slider::new(&mut s.angle, 0.0..=360.0).suffix("°")));
+            }
+            P::Waves => {
+                row(ui, "Amplitude", |ui| ui.add(Slider::new(&mut s.amplitude, 0.0..=500.0).suffix(" px")));
+                row(ui, "Wavelength", |ui| ui.add(Slider::new(&mut s.wavelength, 2.0..=2000.0).logarithmic(true).suffix(" px")));
+                row(ui, "Vertical", |ui| ui.checkbox(&mut s.wave_vertical, ""));
+            }
+            P::Flow | P::Curl => {
+                row(ui, "Swirl size", |ui| ui.add(Slider::new(&mut s.noise_size, 4.0..=2000.0).logarithmic(true).suffix(" px")));
+                row(ui, "Seed", |ui| ui.add(DragValue::new(&mut s.seed)));
+            }
+            P::Swirls => {
+                row(ui, "Points", |ui| ui.add(Slider::new(&mut s.swirls, 1..=32)));
+                row(ui, "Seed", |ui| ui.add(DragValue::new(&mut s.seed)));
+            }
+            P::Contours => {
+                row(ui, "Smoothness", |ui| ui.add(Slider::new(&mut s.contour_smooth, 0..=64).suffix(" px")));
+            }
+            P::Drawn => {
+                row(ui, "", |ui| ui.label("No direction brush yet: vertical lines."));
+            }
+            P::Star => {
+                row(ui, "Rays", |ui| ui.add(Slider::new(&mut s.star_points, 2..=32)));
+                row(ui, "Inner", |ui| ui.add(Slider::new(&mut s.star_inner, 0.0..=1.0)));
+            }
+            P::Tiles => {
+                row(ui, "Tile size", |ui| ui.add(Slider::new(&mut s.tile, 2..=1024).logarithmic(true).suffix(" px")));
+            }
+            _ => {}
+        }
+    }
+
+    fn extra_rows(&mut self, ui: &mut Ui) {
+        let s = &mut self.s;
+        row(ui, "Alternate", |ui| ui.checkbox(&mut s.alternate, "").on_hover_text("Reverse every second span"));
+        row(ui, "Channel", |ui| combo(ui, "channel", &mut s.channel, Channel::ALL.iter().copied(), Channel::name));
+        row(ui, "Posterize", |ui| ui.add(Slider::new(&mut s.posterize, 0..=32)).on_hover_text("Levels per channel, 0 = off"));
+        row(ui, "Soft ends", |ui| ui.add(Slider::new(&mut s.soft_ends, 0..=200).suffix(" px")));
+        row(ui, "Fringes", |ui| ui.add(Slider::new(&mut s.fringes, -50..=50).suffix(" px")));
+        row(ui, "Target", |ui| {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut s.target).on_hover_text("Color for the Distance criterion");
+                pick_button(ui, &mut self.pick, Pick::Color, "Pick on image");
+            })
+        });
+        let guide = self.doc.as_ref().map(|d| d.guide_name.clone());
+        let (mut load, mut clear) = (false, false);
+        row(ui, "Guide", |ui| {
+            ui.horizontal(|ui| {
+                load = ui.add_enabled(guide.is_some(), Button::new("Load…")).clicked();
+                if let Some(Some(name)) = &guide {
+                    clear = ui.small_button("Clear").clicked();
+                    ui.add(egui::Label::new(name.as_str()).truncate());
+                }
+            })
+        });
+        if load {
+            self.guide_dialog();
+        }
+        if clear {
+            self.clear_guide();
+        }
+    }
+}
+
+fn selection_rows(ui: &mut Ui, s: &mut Settings) {
+    row(ui, "Selector", |ui| combo(ui, "select", &mut s.select, K::ALL.iter().copied(), K::name));
+    match s.select {
+        K::Fixed => {
+            row(ui, "Length", |ui| ui.add(Slider::new(&mut s.length, 0..=2000).logarithmic(true).suffix(" px")));
+        }
+        K::Random => {
+            row(ui, "Max length", |ui| ui.add(Slider::new(&mut s.max_length, 0..=2000).logarithmic(true).suffix(" px")));
+        }
+        K::Threshold => condition(ui, "a", &mut s.crit, &mut s.min, &mut s.max, s.target),
+        K::Combined => {
+            condition(ui, "a", &mut s.crit, &mut s.min, &mut s.max, s.target);
+            row(ui, "Join", |ui| combo(ui, "combine", &mut s.combine, Combine::ALL.iter().copied(), Combine::name));
+            condition(ui, "b", &mut s.crit2, &mut s.min2, &mut s.max2, s.target);
+        }
+        K::Edges => {
+            row(ui, "Edge", |ui| ui.add(Slider::new(&mut s.edge, 0..=765)).on_hover_text("Color jump that ends a span"));
+        }
+        K::Full => {}
+    }
+    if pixlflow::select::looks_at_color(s.select) {
+        row(ui, "Smooth", |ui| ui.add(Slider::new(&mut s.smooth, 0..=50).suffix(" px")).on_hover_text("Blur used only to find spans"));
+    }
+}
+
+fn condition(ui: &mut Ui, id: &str, crit: &mut Criterion, min: &mut u32, max: &mut u32, target: Rgb) {
+    let all = Criterion::ALL.iter().copied().filter(|&c| c != Criterion::Guide);
+    row(ui, "Criterion", |ui| combo(ui, &format!("crit-{id}"), crit, all, Criterion::name));
+    let top = color::max_value(*crit) as u32;
+    row(ui, "Min", |ui| ui.add(Slider::new(min, 0..=top)).on_hover_text("Min above max wraps around (e.g. hue 340–20 = red)"));
+    row(ui, "Max", |ui| ui.add(Slider::new(max, 0..=top)));
+    row(ui, "", |ui| color_strip(ui, *crit, target));
+}
+
+fn sorting_rows(ui: &mut Ui, s: &mut Settings) {
+    row(ui, "Sort by", |ui| combo(ui, "by", &mut s.by, Criterion::ALL.iter().copied(), Criterion::name));
+    row(ui, "Algorithm", |ui| combo(ui, "algo", &mut s.algo, Algorithm::ALL.iter().copied(), Algorithm::name));
+    match s.algo {
+        Algorithm::Partial => {
+            row(ui, "Passes", |ui| ui.add(Slider::new(&mut s.passes, 1..=500).logarithmic(true)));
+        }
+        Algorithm::Stretch | Algorithm::Shift => {
+            row(ui, "Strength", |ui| ui.add(Slider::new(&mut s.strength, 0.0..=1.0)));
+        }
+        Algorithm::Bucket => {
+            row(ui, "Levels", |ui| ui.add(Slider::new(&mut s.buckets, 2..=64)));
+        }
+        _ => {}
+    }
+    if matches!(s.algo, Algorithm::Shuffle | Algorithm::Debug | Algorithm::Shift) || s.select == K::Random {
+        row(ui, "Seed", |ui| ui.add(DragValue::new(&mut s.seed)));
+    }
+}
+
+fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).strong()).default_open(true).show(ui, |ui| {
+        egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).min_col_width(80.0).show(ui, add);
+    });
+}
+
+fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) {
+    ui.label(label);
+    add(ui);
+    ui.end_row();
+}
+
+/// "square-spiral" → "Square spiral".
+fn pretty(name: &str) -> String {
+    let s = name.replace('-', " ");
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+fn combo<T: Copy + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, all: impl Iterator<Item = T>, name: fn(T) -> &'static str) {
+    egui::ComboBox::from_id_salt(id).selected_text(pretty(name(*value))).width(180.0).show_ui(ui, |ui| {
+        for v in all {
+            ui.selectable_value(value, v, pretty(name(v)));
+        }
+    });
+}
+
+fn pick_button(ui: &mut Ui, pick: &mut Option<Pick>, which: Pick, text: &str) {
+    let on = *pick == Some(which);
+    if ui.selectable_label(on, text).clicked() {
+        *pick = if on { None } else { Some(which) };
+    }
+}
+
+/// Colour bar under the threshold sliders, drawn in code (no images).
+fn color_strip(ui: &mut Ui, crit: Criterion, target: Rgb) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.spacing().slider_width, 8.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let max = color::max_value(crit) as f32;
+    const N: usize = 90;
+    for i in 0..N {
+        let (t0, t1) = (i as f32 / N as f32, (i + 1) as f32 / N as f32);
+        let r = Rect::from_min_max(pos2(rect.lerp_inside(vec2(t0, 0.0)).x, rect.top()), pos2(rect.lerp_inside(vec2(t1, 0.0)).x, rect.bottom()));
+        painter.rect_filled(r, 0.0, sample_color(crit, (t0 + t1) / 2.0 * max, target));
+    }
+}
+
+/// A colour whose `crit` value is about `v`.
+fn sample_color(crit: Criterion, v: f32, target: Rgb) -> Color32 {
+    let t = (v / 255.0).clamp(0.0, 1.0);
+    let b = v.clamp(0.0, 255.0) as u8;
+    let mix = |a: [f32; 3], c: [f32; 3]| Color32::from_rgb((a[0] + (c[0] - a[0]) * t) as u8, (a[1] + (c[1] - a[1]) * t) as u8, (a[2] + (c[2] - a[2]) * t) as u8);
+    match crit {
+        Criterion::Hue => egui::ecolor::Hsva::new(v / 360.0, 1.0, 1.0, 1.0).into(),
+        Criterion::Red => Color32::from_rgb(b, 0, 0),
+        Criterion::Green => Color32::from_rgb(0, b, 0),
+        Criterion::Blue => Color32::from_rgb(0, 0, b),
+        Criterion::Saturation => mix([255.0; 3], [255.0, 0.0, 0.0]),
+        Criterion::Chroma => mix([128.0; 3], [255.0, 0.0, 0.0]),
+        Criterion::Warmth => mix([0.0, 0.0, 255.0], [255.0, 0.0, 0.0]),
+        Criterion::ColorDistance => {
+            let far = target.map(|c| if c < 128 { 255.0 } else { 0.0 });
+            mix(target.map(|c| c as f32), far)
+        }
+        Criterion::Brightness | Criterion::Lightness | Criterion::MinChannel | Criterion::MaxChannel | Criterion::Guide => {
+            Color32::from_gray(b)
+        }
+    }
+}

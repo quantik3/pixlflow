@@ -1,50 +1,65 @@
-//! Pixlflow command line.
+//! Pixlflow: GUI when started without arguments, command line otherwise.
 
-use image::{imageops::FilterType, ColorType, DynamicImage, ImageFormat, RgbImage, RgbaImage};
-use pixlflow::{color, engine, settings::Settings, Rgb};
-use std::{
-    io::{Cursor, Read, Write},
-    path::Path,
-    process::ExitCode,
-    time::Instant,
-};
+// Release builds are GUI programs (no console window); output still reaches the terminal they start from.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod gui;
+
+use pixlflow::{engine, imageio, settings::Settings};
+use std::{path::PathBuf, process::ExitCode, time::Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default)]
 struct Args {
     settings: Settings,
-    input: Option<String>,
-    output: Option<String>,
-    mask: Option<String>,
-    guide: Option<String>,
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    mask: Option<PathBuf>,
+    guide: Option<PathBuf>,
     show_mask: bool,
     quiet: bool,
     gui: bool,
 }
 
 fn main() -> ExitCode {
+    attach_console();
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.is_empty() {
-        // shortcut: no GUI until stage 2, so no arguments shows help instead
-        print_help();
-        return ExitCode::SUCCESS;
-    }
-    match parse(&argv) {
-        Ok(None) => ExitCode::SUCCESS,
-        Ok(Some(a)) => match run(a) {
-            Ok(()) => ExitCode::SUCCESS,
+    let args = if argv.is_empty() {
+        Args { gui: true, ..Default::default() }
+    } else {
+        match parse(&argv) {
+            Ok(Some(a)) => a,
+            Ok(None) => return ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("pixlflow: error: {e}");
-                ExitCode::from(1)
+                eprintln!("pixlflow: {e}\nTry 'pixlflow --help'.");
+                return ExitCode::from(2);
             }
-        },
+        }
+    };
+    let result = if args.gui { gui::run(args.settings, args.input, args.output) } else { run(args) };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pixlflow: {e}\nTry 'pixlflow --help'.");
-            ExitCode::from(2)
+            eprintln!("pixlflow: error: {e}");
+            ExitCode::from(1)
         }
     }
 }
+
+/// A GUI-subsystem program has no console; borrow the parent's so messages reach the terminal.
+#[cfg(windows)]
+fn attach_console() {
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: plain Win32 call; failure (no parent console, or one already attached) is harmless.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
 
 /// `Ok(None)` when help/version was printed.
 fn parse(argv: &[String]) -> Result<Option<Args>, String> {
@@ -53,11 +68,11 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         if arg == "-" || !arg.starts_with('-') {
-            positional.push(arg.clone());
+            positional.push(PathBuf::from(arg));
             continue;
         }
         if arg == "--" {
-            positional.extend(it.by_ref().cloned());
+            positional.extend(it.by_ref().map(PathBuf::from));
             break;
         }
         let body = arg.trim_start_matches('-');
@@ -78,8 +93,8 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "q" | "quiet" => a.quiet = true,
             "show-mask" => a.show_mask = true,
             "gui" => a.gui = true,
-            "mask" => a.mask = Some(value()?),
-            "guide" => a.guide = Some(value()?),
+            "mask" => a.mask = Some(value()?.into()),
+            "guide" => a.guide = Some(value()?.into()),
             "preset" => a.settings.apply_preset(&value()?)?,
             _ => {
                 let info = Settings::keys().into_iter().find(|i| i.key == key).ok_or(format!("unknown option '{arg}'"))?;
@@ -101,95 +116,40 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
 }
 
 fn run(a: Args) -> Result<(), String> {
-    if a.gui {
-        return Err("the GUI is not available yet; give INPUT [OUTPUT] to sort from the command line".into());
-    }
     let input = a.input.unwrap_or_default();
-    let img = read_image(&input)?;
-    if !matches!(img.color(), ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8) && !a.quiet {
-        eprintln!("pixlflow: warning: '{input}' has more than 8 bits per channel; reducing to 8 bits");
+    let pic = imageio::load(&input)?;
+    if pic.deep && !a.quiet {
+        eprintln!("pixlflow: warning: '{}' has more than 8 bits per channel; reducing to 8 bits", input.display());
     }
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let alpha = img.color().has_alpha().then(|| img.to_rgba8().pixels().map(|p| p[3]).collect::<Vec<u8>>());
-    let rgb: Vec<Rgb> = img.to_rgb8().pixels().map(|p| p.0).collect();
-
-    let mask = a.mask.as_deref().map(|p| load_gray(p, w, h, false)).transpose()?;
-    let guide = a.guide.as_deref().map(|p| load_gray(p, w, h, true)).transpose()?;
+    let (w, h) = (pic.w, pic.h);
+    let mask = a.mask.as_deref().map(|p| imageio::load_gray(p, w, h, false)).transpose()?;
+    let guide = a.guide.as_deref().map(|p| imageio::load_gray(p, w, h, true)).transpose()?;
 
     let started = Instant::now();
     let (out, alpha) = if a.show_mask {
-        (engine::selection_map(&a.settings, w, h, &rgb).into_iter().map(|v| [v; 3]).collect(), None)
+        (engine::selection_map(&a.settings, w, h, &pic.rgb).into_iter().map(|v| [v; 3]).collect(), None)
     } else {
         let ex = engine::Extras { mask: mask.as_deref(), guide: guide.as_deref(), directions: None };
-        (engine::render(&a.settings, w, h, &rgb, &ex), alpha)
+        (engine::render(&a.settings, w, h, &pic.rgb, &ex), pic.alpha.as_deref())
     };
     let elapsed = started.elapsed();
 
     let output = a.output.unwrap_or_else(|| default_output(&input));
-    save(&output, w as u32, h as u32, &out, alpha.as_deref())?;
+    imageio::save(&output, w, h, &out, alpha)?;
     if !a.quiet {
-        eprintln!("pixlflow: {w}x{h} in {} ms -> {output}", elapsed.as_millis());
+        eprintln!("pixlflow: {w}x{h} in {} ms -> {}", elapsed.as_millis(), output.display());
     }
     Ok(())
 }
 
-fn read_image(path: &str) -> Result<DynamicImage, String> {
-    let decoded = if path == "-" {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf).map_err(|e| format!("cannot read stdin: {e}"))?;
-        image::load_from_memory(&buf)
-    } else {
-        image::ImageReader::open(path)
-            .and_then(|r| r.with_guessed_format())
-            .map_err(|e| format!("cannot open '{path}': {e}"))?
-            .decode()
-    };
-    decoded.map_err(|e| format!("cannot read image '{path}': {e}"))
-}
-
-/// Brightness of a grey image. A mask must match the image size; a guide is resized (bilinear).
-fn load_gray(path: &str, w: usize, h: usize, resize: bool) -> Result<Vec<u8>, String> {
-    let mut img = read_image(path)?;
-    if (img.width() as usize, img.height() as usize) != (w, h) {
-        if !resize {
-            return Err(format!("mask '{path}' is {}x{}, but the image is {w}x{h}", img.width(), img.height()));
-        }
-        img = img.resize_exact(w as u32, h as u32, FilterType::Triangle);
+/// `<name>-sorted.<ext>` next to the input (stdout for stdin).
+pub fn default_output(input: &std::path::Path) -> PathBuf {
+    if input == std::path::Path::new("-") {
+        return input.into();
     }
-    Ok(img.to_rgb8().pixels().map(|p| color::brightness(p.0) as u8).collect())
-}
-
-fn default_output(input: &str) -> String {
-    if input == "-" {
-        return "-".into();
-    }
-    let p = Path::new(input);
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("png");
-    p.with_file_name(format!("{stem}-sorted.{ext}")).to_string_lossy().into_owned()
-}
-
-fn save(path: &str, w: u32, h: u32, px: &[Rgb], alpha: Option<&[u8]>) -> Result<(), String> {
-    let fmt = if path == "-" {
-        ImageFormat::Png
-    } else {
-        ImageFormat::from_path(path).map_err(|_| format!("unknown output format for '{path}' (use .png, .jpg, .webp or .gif)"))?
-    };
-    let img = match alpha {
-        // the alpha channel never moves; it is written back where the format has one
-        Some(a) if fmt != ImageFormat::Jpeg => DynamicImage::ImageRgba8(
-            RgbaImage::from_raw(w, h, px.iter().zip(a).flat_map(|(p, &a)| [p[0], p[1], p[2], a]).collect()).unwrap(),
-        ),
-        _ => DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, px.concat()).unwrap()),
-    };
-    let img = if fmt == ImageFormat::Gif { DynamicImage::ImageRgba8(img.to_rgba8()) } else { img };
-    if path == "-" {
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, fmt).map_err(|e| format!("cannot encode PNG: {e}"))?;
-        std::io::stdout().write_all(buf.get_ref()).map_err(|e| format!("cannot write stdout: {e}"))
-    } else {
-        img.save_with_format(path, fmt).map_err(|e| format!("cannot save '{path}': {e}"))
-    }
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    input.with_file_name(format!("{stem}-sorted.{ext}"))
 }
 
 fn print_help() {
@@ -197,11 +157,15 @@ fn print_help() {
         "pixlflow {VERSION} - pixel sorter
 
 Usage: pixlflow [OPTIONS] INPUT [OUTPUT]
+       pixlflow --gui [OPTIONS] [INPUT [OUTPUT]]
+       pixlflow                      (opens the window)
 
 INPUT/OUTPUT are image files or '-' for stdin/stdout (stdout is PNG).
 Without OUTPUT the result goes to <name>-sorted.<ext> next to INPUT.
+With --gui the window opens with these settings; Save then writes exactly to OUTPUT if given.
 
 Options:
+  --gui                open the window instead of sorting once
   --preset TEXT        start from preset text (\"key=value ...\"); later options override it
   --mask FILE          grey mask, same size as INPUT: black = untouched, white = full effect
   --guide FILE         guide image for '--by guide' (resized to INPUT)

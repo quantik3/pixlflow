@@ -4,6 +4,7 @@ pub mod algo;
 pub mod color;
 pub mod engine;
 mod gilbert;
+pub mod imageio;
 pub mod paths;
 pub mod select;
 pub mod settings;
