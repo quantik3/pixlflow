@@ -1,0 +1,16 @@
+[package]
+name = "pixlflow"
+version = "0.1.0"
+edition = "2021"
+description = "Pixlflow - pixel sorter"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "rayon"] }
+rayon = "1"
+
+# Tests run in the dev profile (overflow checks stay on); a little optimisation keeps them quick.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
