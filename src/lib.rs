@@ -1,6 +1,7 @@
 //! Pixlflow core: paths, span selectors, span algorithms and the render pipeline.
 
 pub mod algo;
+pub mod brush;
 pub mod color;
 pub mod engine;
 mod gilbert;

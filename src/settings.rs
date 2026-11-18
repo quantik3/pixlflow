@@ -153,6 +153,19 @@ named_enum!(Channel { All = "all", Red = "r", Green = "g", Blue = "b" });
 
 named_enum!(Combine { And = "and", Or = "or" });
 
+named_enum!(BlendMode {
+    Normal = "normal",
+    Lighten = "lighten",
+    Darken = "darken",
+    Multiply = "multiply",
+    Screen = "screen",
+    Overlay = "overlay",
+    Difference = "difference",
+    Add = "add",
+    Color = "color",
+    Luminosity = "luminosity",
+});
+
 pub struct KeyInfo {
     pub key: &'static str,
     pub help: &'static str,
@@ -232,6 +245,8 @@ settings! {
     soft_ends: u32 = 0, "soft-ends", "blend span ends over N px (0 = off)";
     fringes: i32 = 0, "fringes", "chromatic shift of red/blue, px";
     target: Rgb = [255, 0, 0], "target", "color for the distance criterion (#rrggbb)";
+    blend: BlendMode = BlendMode::Normal, "blend", "how the result combines with the image below";
+    opacity: f32 = 1.0, "opacity", "strength of the result, 0-1";
 }
 
 impl Settings {

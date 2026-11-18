@@ -1,8 +1,8 @@
-//! The render pipeline: paths → spans → algorithm → extras (§6) → mask blend.
+//! The render pipeline: paths → spans → algorithm → extras (§6) → blend with the input (mode, opacity, mask).
 
 use crate::{
     algo, box_blur, color, lerp_rgb, paths, select,
-    settings::{Algorithm, Channel, Criterion, PathKind, Settings},
+    settings::{Algorithm, BlendMode, Channel, Criterion, PathKind, Settings},
     Rgb, Rng,
 };
 use rayon::prelude::*;
@@ -49,12 +49,58 @@ pub fn render(s: &Settings, w: usize, h: usize, src: &[Rgb], ex: &Extras) -> Vec
     if s.fringes != 0 {
         fringes(&mut out, w, h, s.fringes as i64, mask);
     }
-    if let Some(m) = mask {
-        out.par_iter_mut().zip(src).zip(m).for_each(|((o, &s), &m)| {
-            *o = std::array::from_fn(|c| ((s[c] as u32 * (255 - m as u32) + o[c] as u32 * m as u32 + 127) / 255) as u8)
+    // result = below + (blend(below, sorted) − below) · opacity · mask
+    let opacity = s.opacity.clamp(0.0, 1.0);
+    if s.blend != BlendMode::Normal || opacity < 1.0 || mask.is_some() {
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            let k = mask.map_or(1.0, |m| m[i] as f32 / 255.0) * opacity;
+            *o = if k == 0.0 { src[i] } else { lerp_rgb(src[i], blend(s.blend, src[i], *o), k) };
         });
     }
     out
+}
+
+/// Blends `top` over `lower` (channels as 0–1).
+pub fn blend(mode: BlendMode, lower: Rgb, top: Rgb) -> Rgb {
+    let (a, b) = (lower.map(|c| c as f32 / 255.0), top.map(|c| c as f32 / 255.0));
+    let r = match mode {
+        BlendMode::Color => set_lum(b, lum(a)),
+        BlendMode::Luminosity => set_lum(a, lum(b)),
+        _ => std::array::from_fn(|c| {
+            let (x, y) = (a[c], b[c]);
+            match mode {
+                BlendMode::Lighten => x.max(y),
+                BlendMode::Darken => x.min(y),
+                BlendMode::Multiply => x * y,
+                BlendMode::Screen => 1.0 - (1.0 - x) * (1.0 - y),
+                BlendMode::Overlay if x < 0.5 => 2.0 * x * y,
+                BlendMode::Overlay => 1.0 - 2.0 * (1.0 - x) * (1.0 - y),
+                BlendMode::Difference => (x - y).abs(),
+                BlendMode::Add => (x + y).min(1.0),
+                _ => y, // Normal
+            }
+        }),
+    };
+    r.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn lum(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+/// Gives `c` luminance `l`; a colour pushed outside 0–1 is desaturated toward its luminance.
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let c = c.map(|v| v + l - lum(c));
+    let l = lum(c);
+    let (n, x) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
+    let mut c = c;
+    if n < 0.0 {
+        c = c.map(|v| l + (v - l) * l / (l - n));
+    }
+    if x > 1.0 {
+        c = c.map(|v| l + (v - l) * (1.0 - l) / (x - l));
+    }
+    c
 }
 
 /// White where a Threshold/Combined selector picks the pixel (everything white for other selectors).

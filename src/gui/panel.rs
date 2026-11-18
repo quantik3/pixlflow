@@ -1,10 +1,10 @@
 //! The settings panel (fixed width, vertical scroll only).
 
-use super::{App, Pick};
+use super::{App, MaskAction, Pick, Tool};
 use eframe::egui::{self, pos2, vec2, Button, Color32, DragValue, Rect, RichText, Sense, Slider, Ui};
 use pixlflow::{
     color,
-    settings::{Algorithm, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
+    settings::{Algorithm, BlendMode, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
     Rgb,
 };
 
@@ -67,16 +67,112 @@ impl App {
                 self.redo();
             }
         });
+        ui.separator();
+        self.layer_list(ui);
         ui.add_space(4.0);
 
+        section(ui, "Layer", |ui| {
+            let s = &mut self.layers[self.cur].s;
+            row(ui, "Blend", |ui| combo(ui, "blend", &mut s.blend, BlendMode::ALL.iter().copied(), BlendMode::name));
+            row(ui, "Opacity", |ui| ui.add(Slider::new(&mut s.opacity, 0.0..=1.0)));
+        });
         section(ui, "Path", |ui| self.path_rows(ui));
-        section(ui, "Selection", |ui| selection_rows(ui, &mut self.s));
-        section(ui, "Sorting", |ui| sorting_rows(ui, &mut self.s));
+        section(ui, "Selection", |ui| selection_rows(ui, &mut self.layers[self.cur].s));
+        section(ui, "Sorting", |ui| sorting_rows(ui, &mut self.layers[self.cur].s));
         section(ui, "Extras", |ui| self.extra_rows(ui));
+        self.brush_section(ui);
+    }
+
+    fn layer_list(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Layers");
+            if ui.small_button("+ Add").clicked() {
+                self.add_layer();
+            }
+            ui.toggle_value(&mut self.show_original, "Show original");
+        });
+        let mut delete = None;
+        for i in (0..self.layers.len()).rev() {
+            let s = &self.layers[i].s;
+            let text = format!(
+                "{}. {} · {} · {} {:.0}%",
+                i + 1,
+                pretty(s.path.name()),
+                pretty(s.algo.name()),
+                pretty(s.blend.name()),
+                s.opacity * 100.0
+            );
+            let deletable = self.layers.len() > 1;
+            ui.horizontal(|ui| {
+                let r = ui.selectable_label(self.cur == i, text);
+                if r.clicked() {
+                    self.cur = i;
+                }
+                if deletable && (r.middle_clicked() || ui.small_button("X").on_hover_text("Delete (or middle click)").clicked()) {
+                    delete = Some(i);
+                }
+            });
+        }
+        if let Some(i) = delete {
+            self.delete_layer(i);
+        }
+    }
+
+    fn brush_section(&mut self, ui: &mut Ui) {
+        let mut action = None;
+        egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show(ui, |ui| {
+            let b = &mut self.brush;
+            egui::Grid::new("brush").num_columns(2).spacing([10.0, 6.0]).min_col_width(80.0).show(ui, |ui| {
+                row(ui, "Brush", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut b.on, "On (B)");
+                        ui.selectable_value(&mut b.tool, Tool::Mask, "Mask");
+                        ui.selectable_value(&mut b.tool, Tool::Directions, "Directions");
+                    })
+                });
+                row(ui, "Radius", |ui| ui.add(Slider::new(&mut b.radius, 1.0..=1000.0).logarithmic(true).suffix(" px")));
+                if b.tool == Tool::Mask {
+                    row(ui, "Hardness", |ui| ui.add(Slider::new(&mut b.hardness, 0.0..=1.0)));
+                }
+                row(ui, "Erase", |ui| ui.checkbox(&mut b.erase, "").on_hover_text("Left button erases, right paints"));
+            });
+            let l = &self.layers[self.cur];
+            if b.tool == Tool::Directions {
+                ui.label(if l.dirs.is_some() { "Directions drawn on this layer." } else { "No directions drawn." });
+                if ui.button("Clear directions").clicked() {
+                    action = Some(None);
+                }
+                return;
+            }
+            ui.label(if l.mask.is_some() { "Mask: painted (red = sorted)." } else { "Mask: none, the whole image is sorted." });
+            ui.horizontal_wrapped(|ui| {
+                for (text, act, tip) in [
+                    ("Fill", MaskAction::Fill, "Sort everywhere"),
+                    ("Clear", MaskAction::Clear, "Sort nowhere"),
+                    ("Invert", MaskAction::Invert, ""),
+                    ("Remove", MaskAction::Remove, "Drop the mask: sort everywhere"),
+                    ("From threshold", MaskAction::FromThreshold, "What Show mask shows"),
+                    ("From guide", MaskAction::FromGuide, "Brightness of the guide image"),
+                    ("Load…", MaskAction::Load, "Grey image, scaled to fit"),
+                    ("Save…", MaskAction::Save, "As PNG"),
+                ] {
+                    let r = ui.add_enabled(self.doc.is_some(), Button::new(text));
+                    let r = if tip.is_empty() { r } else { r.on_hover_text(tip) };
+                    if r.clicked() {
+                        action = Some(Some(act));
+                    }
+                }
+            });
+        });
+        match action {
+            Some(Some(act)) => self.mask_action(act),
+            Some(None) => self.layer().dirs = None,
+            None => {}
+        }
     }
 
     fn path_rows(&mut self, ui: &mut Ui) {
-        let s = &mut self.s;
+        let s = &mut self.layers[self.cur].s;
         row(ui, "Shape", |ui| combo(ui, "path", &mut s.path, P::ALL.iter().copied(), P::name));
         row(ui, "Reverse", |ui| ui.checkbox(&mut s.reverse, ""));
         if matches!(s.path, P::Rays | P::Circles | P::Spiral | P::SquareSpiral | P::RectSpiral | P::Star | P::Swirls) {
@@ -109,7 +205,7 @@ impl App {
                 row(ui, "Smoothness", |ui| ui.add(Slider::new(&mut s.contour_smooth, 0..=64).suffix(" px")));
             }
             P::Drawn => {
-                row(ui, "", |ui| ui.label("No direction brush yet: vertical lines."));
+                row(ui, "", |ui| ui.label("Paint directions with the brush (B)."));
             }
             P::Star => {
                 row(ui, "Rays", |ui| ui.add(Slider::new(&mut s.star_points, 2..=32)));
@@ -123,7 +219,7 @@ impl App {
     }
 
     fn extra_rows(&mut self, ui: &mut Ui) {
-        let s = &mut self.s;
+        let s = &mut self.layers[self.cur].s;
         row(ui, "Alternate", |ui| ui.checkbox(&mut s.alternate, "").on_hover_text("Reverse every second span"));
         row(ui, "Channel", |ui| combo(ui, "channel", &mut s.channel, Channel::ALL.iter().copied(), Channel::name));
         row(ui, "Posterize", |ui| ui.add(Slider::new(&mut s.posterize, 0..=32)).on_hover_text("Levels per channel, 0 = off"));
@@ -135,12 +231,14 @@ impl App {
                 pick_button(ui, &mut self.pick, Pick::Color, "Pick on image");
             })
         });
-        let guide = self.doc.as_ref().map(|d| d.guide_name.clone());
+        let l = &self.layers[self.cur];
+        let guide = l.guide.as_ref().map(|_| l.guide_name.clone().unwrap_or_default());
+        let has_doc = self.doc.is_some();
         let (mut load, mut clear) = (false, false);
         row(ui, "Guide", |ui| {
             ui.horizontal(|ui| {
-                load = ui.add_enabled(guide.is_some(), Button::new("Load…")).clicked();
-                if let Some(Some(name)) = &guide {
+                load = ui.add_enabled(has_doc, Button::new("Load…")).clicked();
+                if let Some(name) = &guide {
                     clear = ui.small_button("Clear").clicked();
                     ui.add(egui::Label::new(name.as_str()).truncate());
                 }
@@ -150,7 +248,8 @@ impl App {
             self.guide_dialog();
         }
         if clear {
-            self.clear_guide();
+            let l = self.layer();
+            (l.guide, l.guide_name) = (None, None);
         }
     }
 }

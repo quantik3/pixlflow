@@ -5,7 +5,7 @@ use pixlflow::{
     engine::{self, Extras},
     paths::{self, PathInput},
     select,
-    settings::{Algorithm as A, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
+    settings::{Algorithm as A, BlendMode, Channel, Combine, Criterion, PathKind as P, SelectorKind as K, Settings},
     Rgb, Rng,
 };
 
@@ -110,10 +110,12 @@ fn pixels_outside_the_mask_never_change() {
     let mut r = Rng::new(9);
     let mask: Vec<u8> = (0..w * h).map(|_| [0, 0, 128, 255][r.below(4) as usize]).collect();
     for &algo in A::ALL {
-        for &path in &[P::Lines, P::Circles, P::Flow, P::Snake] {
+        for (&path, &blend) in [P::Lines, P::Circles, P::Flow, P::Snake].iter().cycle().zip(BlendMode::ALL) {
             let s = Settings {
                 algo,
                 path,
+                blend,
+                opacity: 0.8,
                 select: K::Full,
                 posterize: 3,
                 soft_ends: 2,
@@ -213,6 +215,26 @@ fn box_blur_is_window_mean() {
         }
     }
     assert!(box_blur(&vec![7.0; 40 * 30], 40, 30, 5).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn blend_modes() {
+    use engine::blend;
+    let (grey, red) = ([128, 128, 128], [255, 0, 0]);
+    assert_eq!(blend(BlendMode::Normal, grey, red), red);
+    assert_eq!(blend(BlendMode::Multiply, red, [255; 3]), red);
+    assert_eq!(blend(BlendMode::Screen, red, [0; 3]), red);
+    assert_eq!(blend(BlendMode::Difference, red, red), [0; 3]);
+    assert_eq!(blend(BlendMode::Add, grey, grey), [255; 3]);
+    assert_eq!(blend(BlendMode::Lighten, [10, 200, 30], [100, 20, 30]), [100, 200, 30]);
+    // Color keeps the lower brightness, Luminosity keeps the lower hue
+    let c = blend(BlendMode::Color, grey, red);
+    assert!(c[0] > c[1] && (color::brightness(c) as i32 - 128).abs() < 40);
+    assert_eq!(blend(BlendMode::Luminosity, grey, [255; 3]), [255; 3]);
+    // opacity 0 leaves the image as it was
+    let img = noise_image(9, 7, 21);
+    let s = Settings { select: K::Full, opacity: 0.0, ..Default::default() };
+    assert_eq!(engine::render(&s, 9, 7, &img, &Extras::default()), img);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use pixlflow::{engine, imageio, settings::Settings, Rgb};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use worker::{Done, Job, Kind, Worker};
+use worker::{Done, Job, Kind, Layer, Worker};
 
 const PANEL_WIDTH: f32 = 380.0;
 const PREVIEW_SIDE: usize = 1000;
@@ -48,20 +48,16 @@ struct Doc {
     alpha: Option<Vec<u8>>,
     /// Downscaled copy for fast previews (only for big images).
     small: Option<Small>,
-    guide: Option<Arc<Vec<u8>>>,
-    guide_name: Option<String>,
     orig_tex: TextureHandle,
     result_tex: TextureHandle,
-    /// Last full-size result and the settings that made it.
-    result: Option<(Settings, Vec<Rgb>)>,
+    /// Brush overlay and what it currently shows: (layer, tool, buffer address).
+    overlay: Option<(TextureHandle, (usize, Tool, usize))>,
 }
 
 struct Small {
     w: usize,
     h: usize,
-    k: f32,
     src: Arc<Vec<Rgb>>,
-    guide: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -70,24 +66,49 @@ enum Pick {
     Color,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tool {
+    Mask,
+    Directions,
+}
+
+struct Brush {
+    on: bool,
+    tool: Tool,
+    radius: f32,
+    hardness: f32,
+    /// Swap the buttons: left erases, right paints.
+    erase: bool,
+    /// Last stamp position (image pixels) of the stroke in progress.
+    last: Option<(f32, f32)>,
+}
+
+/// Layers plus the current layer index.
+type Snapshot = (Vec<Layer>, usize);
+
 pub struct App {
-    s: Settings,
-    committed: Settings,
-    undo: Vec<Settings>,
-    redo: Vec<Settings>,
+    layers: Vec<Layer>,
+    cur: usize,
+    /// Full-size result per layer; entry i is valid while it was made from `layers[i]` and 0..i are valid.
+    cache: Vec<(Layer, Arc<Vec<Rgb>>)>,
+    committed: Vec<Layer>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     doc: Option<Doc>,
     worker: Worker,
     next_id: u64,
     shown_id: u64,
-    /// Last request sent: (settings, kind).
-    requested: Option<(Settings, Kind)>,
+    /// Last request sent: (layers, current layer, kind).
+    requested: Option<(Vec<Layer>, usize, Kind)>,
     sort_now: bool,
     auto_sort: bool,
     background: bool,
     fast_preview: bool,
     compare: bool,
     show_mask: bool,
+    show_original: bool,
     pick: Option<Pick>,
+    brush: Brush,
     view: view::View,
     out_dir: Option<PathBuf>,
     /// Output path given on the command line: Save writes exactly there.
@@ -99,9 +120,12 @@ pub struct App {
 
 impl App {
     fn new(ctx: egui::Context, s: Settings, fixed_output: Option<PathBuf>) -> Self {
+        let layers = vec![Layer { s, ..Default::default() }];
         App {
-            committed: s.clone(),
-            s,
+            committed: layers.clone(),
+            layers,
+            cur: 0,
+            cache: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             doc: None,
@@ -115,7 +139,9 @@ impl App {
             fast_preview: true,
             compare: false,
             show_mask: false,
+            show_original: false,
             pick: None,
+            brush: Brush { on: false, tool: Tool::Mask, radius: 40.0, hardness: 0.5, erase: false, last: None },
             view: view::View::default(),
             out_dir: None,
             fixed_output,
@@ -123,6 +149,10 @@ impl App {
             saved_at: None,
             message: None,
         }
+    }
+
+    fn layer(&mut self) -> &mut Layer {
+        &mut self.layers[self.cur]
     }
 
     fn open(&mut self, ctx: &egui::Context, path: &Path) {
@@ -138,7 +168,7 @@ impl App {
         let small = (long > PREVIEW_SIDE).then(|| {
             let k = PREVIEW_SIDE as f32 / long as f32;
             let (sw, sh) = (((w as f32 * k).round() as usize).max(1), ((h as f32 * k).round() as usize).max(1));
-            Small { w: sw, h: sh, k, src: Arc::new(imageio::resize_rgb(&pic.rgb, w, h, sw, sh)), guide: None }
+            Small { w: sw, h: sh, src: Arc::new(imageio::resize_rgb(&pic.rgb, w, h, sw, sh)) }
         });
         let image = color_image(w, h, &pic.rgb, pic.alpha.as_deref());
         self.doc = Some(Doc {
@@ -150,63 +180,127 @@ impl App {
             src: Arc::new(pic.rgb),
             alpha: pic.alpha,
             small,
-            guide: None,
-            guide_name: None,
-            result: None,
+            overlay: None,
         });
+        // masks, guides and directions belong to the previous image; settings stay
+        for l in &mut self.layers {
+            (l.mask, l.guide, l.guide_name, l.dirs) = (None, None, None, None);
+        }
+        self.committed = self.layers.clone();
+        self.undo.clear();
+        self.redo.clear();
+        self.cache.clear();
         self.shown_id = self.next_id; // drop results still coming for the previous image
         self.requested = None;
         self.view.fit_pending = true;
     }
 
     fn load_guide(&mut self, path: &Path) {
-        let Some(doc) = &mut self.doc else { return };
+        let Some(doc) = &self.doc else { return };
         match imageio::load_gray(path, doc.w, doc.h, true) {
             Ok(g) => {
-                if let Some(sm) = &mut doc.small {
-                    sm.guide = Some(Arc::new(imageio::resize_gray(&g, doc.w, doc.h, sm.w, sm.h)));
-                }
-                doc.guide = Some(Arc::new(g));
-                doc.guide_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                self.invalidate();
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let l = self.layer();
+                (l.guide, l.guide_name) = (Some(Arc::new(g)), name);
             }
             Err(e) => self.message = Some(e),
         }
     }
 
-    fn clear_guide(&mut self) {
-        if let Some(doc) = &mut self.doc {
-            doc.guide = None;
-            doc.guide_name = None;
-            if let Some(sm) = &mut doc.small {
-                sm.guide = None;
-            }
-            self.invalidate();
-        }
+    // ---- layers ----
+
+    fn add_layer(&mut self) {
+        self.layers.insert(self.cur + 1, Layer::default());
+        self.cur += 1;
+        self.cache.truncate(self.cur);
     }
 
-    /// Inputs other than settings changed: the next frame re-sorts.
-    fn invalidate(&mut self) {
-        self.requested = None;
-        self.sort_now = self.auto_sort;
-        if let Some(doc) = &mut self.doc {
-            doc.result = None;
+    fn delete_layer(&mut self, i: usize) {
+        if self.layers.len() < 2 {
+            return; // the last layer stays
         }
+        self.layers.remove(i);
+        self.cache.truncate(i);
+        if self.cur > i {
+            self.cur -= 1;
+        }
+        self.cur = self.cur.min(self.layers.len() - 1);
+    }
+
+    /// How many bottom layers have an up-to-date cached result.
+    fn valid(&self) -> usize {
+        self.cache.iter().zip(&self.layers).take_while(|((done, _), now)| done == *now).count()
+    }
+
+    /// Image after layers `0..upto`, sorting now whatever isn't cached.
+    fn chain(&mut self, upto: usize) -> Option<Arc<Vec<Rgb>>> {
+        let start = self.valid().min(upto);
+        let doc = self.doc.as_ref()?;
+        let mut img = if start == 0 { doc.src.clone() } else { self.cache[start - 1].1.clone() };
+        for i in start..upto {
+            img = Arc::new(worker::render_layer(&self.layers[i], doc.w, doc.h, &img, (doc.w, doc.h)));
+            self.cache.truncate(i);
+            self.cache.push((self.layers[i].clone(), img.clone()));
+        }
+        Some(img)
+    }
+
+    // ---- masks ----
+
+    fn mask_action(&mut self, act: MaskAction) {
+        let Some(doc) = &self.doc else { return };
+        let n = doc.w * doc.h;
+        let (w, h) = (doc.w, doc.h);
+        let new = match act {
+            MaskAction::Fill => Some(vec![255; n]),
+            MaskAction::Clear => Some(vec![0; n]),
+            MaskAction::Invert => Some(self.layers[self.cur].mask.as_ref().map_or(vec![0; n], |m| m.iter().map(|v| 255 - v).collect())),
+            MaskAction::Remove => None,
+            MaskAction::FromGuide => match &self.layers[self.cur].guide {
+                Some(g) => Some(g.to_vec()),
+                None => return self.message = Some("This layer has no guide image.".into()),
+            },
+            MaskAction::FromThreshold => {
+                let Some(input) = self.chain(self.cur) else { return };
+                Some(engine::selection_map(&self.layers[self.cur].s, w, h, &input))
+            }
+            MaskAction::Load => {
+                let Some(p) = rfd::FileDialog::new().add_filter("Images", &IMAGE_EXTS).pick_file() else { return };
+                match imageio::load_gray(&p, w, h, true) {
+                    Ok(m) => Some(m),
+                    Err(e) => return self.message = Some(e),
+                }
+            }
+            MaskAction::Save => {
+                let rgb: Vec<Rgb> = match &self.layers[self.cur].mask {
+                    Some(m) => m.iter().map(|&v| [v; 3]).collect(),
+                    None => vec![[255; 3]; n],
+                };
+                if let Some(p) = rfd::FileDialog::new().set_file_name("mask.png").add_filter("PNG", &["png"]).save_file() {
+                    if let Err(e) = imageio::save(&p, w, h, &rgb, None) {
+                        self.message = Some(e);
+                    }
+                }
+                return;
+            }
+        };
+        self.layer().mask = new.map(Arc::new);
     }
 
     // ---- sorting ----
 
     fn request_sort(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
+        let (w, h, src) = (doc.w, doc.h, doc.src.clone());
+        let small = doc.small.as_ref().map(|s| (s.w, s.h, s.src.clone()));
         let dragging = ctx.input(|i| i.pointer.any_down());
-        let (last_s, last_kind) = match &self.requested {
-            Some((s, k)) => (Some(s), Some(*k)),
-            None => (None, None),
+        let (changed, last_kind) = match &self.requested {
+            Some((l, c, k)) => (*l != self.layers || (self.show_mask && *c != self.cur), Some(*k)),
+            None => (true, None),
         };
-        let changed = last_s != Some(&self.s);
         let kind = if self.show_mask {
             Kind::Mask
-        } else if dragging && self.fast_preview && doc.small.is_some() {
+        } else if dragging && self.fast_preview && small.is_some() {
             Kind::Preview
         } else {
             Kind::Full
@@ -221,28 +315,34 @@ impl App {
             return;
         }
         self.sort_now = false;
+        self.requested = Some((self.layers.clone(), self.cur, kind));
         self.next_id += 1;
-        let job = match (&doc.small, kind) {
-            (Some(sm), Kind::Preview) => Job {
+        let (n, full) = (self.layers.len(), (w, h));
+        let job = match (small, kind) {
+            (Some((sw, sh, small_src)), Kind::Preview) => Job {
                 id: self.next_id,
                 kind,
-                settings: self.s.scaled(sm.k),
-                w: sm.w,
-                h: sm.h,
-                src: sm.src.clone(),
-                guide: sm.guide.clone(),
+                base: small_src,
+                w: sw,
+                h: sh,
+                full,
+                layers: self.layers.clone(),
+                start: 0,
             },
-            _ => Job {
-                id: self.next_id,
-                kind,
-                settings: self.s.clone(),
-                w: doc.w,
-                h: doc.h,
-                src: doc.src.clone(),
-                guide: doc.guide.clone(),
-            },
+            _ => {
+                let end = if kind == Kind::Mask { self.cur + 1 } else { n };
+                let start = self.valid().min(end - (kind == Kind::Mask) as usize);
+                if start == end {
+                    // everything cached: show it right away
+                    self.shown_id = self.next_id;
+                    let img = self.cache[n - 1].1.clone();
+                    self.show(w, h, &img, true);
+                    return;
+                }
+                let base = if start == 0 { src } else { self.cache[start - 1].1.clone() };
+                Job { id: self.next_id, kind, base, w, h, full, layers: self.layers[start..end].to_vec(), start }
+            }
         };
-        self.requested = Some((self.s.clone(), kind));
         if self.background {
             self.worker.send(job);
         } else {
@@ -258,34 +358,34 @@ impl App {
     }
 
     fn apply(&mut self, d: Done) {
-        let Some(doc) = &mut self.doc else { return };
         if d.id <= self.shown_id {
             return; // older than what is on screen, or for a previous image
         }
         self.shown_id = d.id;
-        match d.px {
+        for (k, r) in d.results.into_iter().enumerate() {
+            let i = d.start + k;
+            if i > self.cache.len() {
+                break; // the stack changed meanwhile
+            }
+            self.cache.truncate(i);
+            self.cache.push(r);
+        }
+        match d.display {
             Err(e) => self.message = Some(e),
-            Ok(px) => {
-                let alpha = if d.kind == Kind::Full { doc.alpha.as_deref() } else { None };
-                doc.result_tex.set(color_image(d.w, d.h, &px, alpha), tex_options());
+            Ok(img) => {
+                self.show(d.w, d.h, &img, d.kind == Kind::Full);
                 if d.kind != Kind::Mask {
                     self.sort_ms = Some(d.ms);
-                }
-                if d.kind == Kind::Full {
-                    doc.result = Some((d.settings, px));
                 }
             }
         }
     }
 
-    /// Full-size result for the current settings, sorting now if the last one is stale.
-    fn full_result(&mut self) -> Option<Vec<Rgb>> {
-        let doc = self.doc.as_mut()?;
-        if doc.result.as_ref().is_none_or(|(s, _)| *s != self.s) {
-            let ex = engine::Extras { guide: doc.guide.as_ref().map(|g| g.as_slice()), ..Default::default() };
-            doc.result = Some((self.s.clone(), engine::render(&self.s, doc.w, doc.h, &doc.src, &ex)));
+    fn show(&mut self, w: usize, h: usize, px: &[Rgb], with_alpha: bool) {
+        if let Some(doc) = &mut self.doc {
+            let alpha = if with_alpha { doc.alpha.as_deref() } else { None };
+            doc.result_tex.set(color_image(w, h, px, alpha), tex_options());
         }
-        doc.result.as_ref().map(|(_, px)| px.clone())
     }
 
     // ---- files ----
@@ -309,8 +409,11 @@ impl App {
             None => {
                 let dir = self.out_dir.clone().or_else(|| doc.path.parent().map(Path::to_path_buf)).unwrap_or_default();
                 let (stem, ext) = stem_ext(&doc.path);
-                let s = &self.s;
-                let name = format!("{stem}-{}-{}-{}-{}", s.path.name(), s.select.name(), s.by.name(), s.algo.name());
+                let s = &self.layers[self.layers.len() - 1].s;
+                let mut name = format!("{stem}-{}-{}-{}-{}", s.path.name(), s.select.name(), s.by.name(), s.algo.name());
+                if self.layers.len() > 1 {
+                    name += &format!("-{}layers", self.layers.len());
+                }
                 unique_path(&dir, &name, &ext)
             }
         };
@@ -335,8 +438,8 @@ impl App {
     }
 
     fn save_to(&mut self, path: &Path) {
-        let Some(px) = self.full_result() else { return };
-        let doc = self.doc.as_ref().expect("full_result needs a doc");
+        let Some(px) = self.chain(self.layers.len()) else { return };
+        let doc = self.doc.as_ref().expect("chain needs a doc");
         match imageio::save(path, doc.w, doc.h, &px, doc.alpha.as_deref()) {
             Ok(()) => self.saved_at = Some(Instant::now()),
             Err(e) => self.message = Some(e),
@@ -345,29 +448,37 @@ impl App {
 
     // ---- undo ----
 
-    /// Records a step once the mouse is up, so a whole slider drag is one step.
+    /// Records a step once the mouse is up, so a whole drag or brush stroke is one step.
     fn commit_undo(&mut self, ctx: &egui::Context) {
-        if self.s == self.committed || ctx.input(|i| i.pointer.any_down()) {
+        if self.layers == self.committed || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
-        self.undo.push(std::mem::replace(&mut self.committed, self.s.clone()));
+        let prev = std::mem::replace(&mut self.committed, self.layers.clone());
+        self.undo.push((prev, self.cur));
         if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
 
+    fn restore(&mut self, (layers, cur): Snapshot) -> Snapshot {
+        let now = (std::mem::replace(&mut self.layers, layers), self.cur);
+        self.cur = cur.min(self.layers.len() - 1);
+        self.committed = self.layers.clone();
+        now
+    }
+
     fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.s, prev.clone()));
-            self.committed = prev;
+            let now = self.restore(prev);
+            self.redo.push(now);
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.s, next.clone()));
-            self.committed = next;
+            let now = self.restore(next);
+            self.undo.push(now);
         }
     }
 
@@ -380,7 +491,7 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         // shifted variants first, so Ctrl+Shift+S is not taken as Ctrl+S
-        let [open, save_as, save, redo, undo, fit, mask] = ctx.input_mut(|i| {
+        let [open, save_as, save, redo, undo, fit, mask, brush] = ctx.input_mut(|i| {
             [
                 i.consume_key(cmd, Key::O),
                 i.consume_key(cmd_shift, Key::S),
@@ -389,6 +500,7 @@ impl App {
                 i.consume_key(cmd, Key::Z),
                 i.consume_key(Modifiers::NONE, Key::F),
                 i.consume_key(Modifiers::NONE, Key::M),
+                i.consume_key(Modifiers::NONE, Key::B),
             ]
         });
         if open {
@@ -413,6 +525,9 @@ impl App {
         }
         if mask {
             self.show_mask = !self.show_mask;
+        }
+        if brush {
+            self.brush.on = !self.brush.on;
         }
     }
 
@@ -476,6 +591,18 @@ impl App {
             self.message = None;
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum MaskAction {
+    Fill,
+    Clear,
+    Invert,
+    Remove,
+    FromThreshold,
+    FromGuide,
+    Load,
+    Save,
 }
 
 impl eframe::App for App {
