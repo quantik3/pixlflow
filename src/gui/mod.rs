@@ -41,6 +41,8 @@ pub fn run(settings: Settings, input: Option<PathBuf>, output: Option<PathBuf>) 
             // dark everywhere, matching the neutral dark backdrop behind the image
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             let mut app = App::new(cc.egui_ctx.clone(), settings, output);
+            // egui learns the real limit only on the first frame; the device knows it now
+            app.max_side = cc.wgpu_render_state.as_ref().map_or(2048, |r| r.device.limits().max_texture_dimension_2d as usize);
             if let Some(p) = input {
                 app.open(&cc.egui_ctx, &p);
             }
@@ -150,6 +152,8 @@ pub struct App {
     show_original: bool,
     /// Show the result of the selected layer and those below it instead of the whole stack.
     upto_current: bool,
+    /// Longest image side the graphics card can show as one texture.
+    max_side: usize,
     pick: Option<Pick>,
     brush: Brush,
     view: view::View,
@@ -193,6 +197,7 @@ impl App {
             show_mask: false,
             show_original: false,
             upto_current: false,
+            max_side: 2048,
             pick: None,
             brush: Brush { on: false, tool: Tool::Mask, radius: 40.0, hardness: 0.5, erase: false, last: None, shape: None, feather: 0.0 },
             view: view::View::default(),
@@ -228,7 +233,7 @@ impl App {
     }
 
     fn open_image(&mut self, ctx: &egui::Context, path: &Path) -> bool {
-        let pic = match imageio::load(path) {
+        let pic = match imageio::load(path).and_then(|p| fits_gpu(self.max_side, p.w, p.h).map(|()| p)) {
             Ok(p) => p,
             Err(e) => {
                 self.message = Some(e);
@@ -245,7 +250,9 @@ impl App {
 
     /// A video opens on its first frame; that frame is edited like an image.
     fn open_video(&mut self, ctx: &egui::Context, path: &Path) -> bool {
-        let opened = video::probe(path).and_then(|info| video::frame_at(path, &info, 0.0).map(|px| (info, px)));
+        let opened = video::probe(path)
+            .and_then(|info| fits_gpu(self.max_side, info.w, info.h).map(|()| info))
+            .and_then(|info| video::frame_at(path, &info, 0.0).map(|px| (info, px)));
         match opened {
             Ok((info, rgb)) => {
                 self.set_doc(ctx, path, imageio::Picture { w: info.w, h: info.h, rgb, alpha: None, deep: false });
@@ -836,10 +843,17 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            match self.sort_ms {
-                Some(ms) => ui.label(format!("Sorted in {ms} ms")),
-                None => ui.label("Not sorted yet"),
-            };
+            // the quick previews while dragging don't count: the label would flicker
+            let sorting = self.next_id > self.shown_id && matches!(&self.requested, Some((_, _, k)) if *k != Kind::Preview);
+            if sorting {
+                ui.spinner();
+                ui.label("Sorting…");
+            } else {
+                match self.sort_ms {
+                    Some(ms) => ui.label(format!("Sorted in {ms} ms")),
+                    None => ui.label("Not sorted yet"),
+                };
+            }
             if let Some(doc) = &self.doc {
                 ui.separator();
                 ui.label(format!("{} × {}", doc.w, doc.h));
@@ -904,6 +918,14 @@ impl eframe::App for App {
         self.commit_undo(&ctx);
         self.request_sort(&ctx);
     }
+}
+
+/// The window shows the image as one texture, so a side can't exceed what the graphics card allows.
+fn fits_gpu(max: usize, w: usize, h: usize) -> Result<(), String> {
+    if w.max(h) <= max {
+        return Ok(());
+    }
+    Err(format!("The image is {w} × {h}, but this graphics card can show at most {max} px on a side. Larger images can be sorted from the command line."))
 }
 
 /// Downscaled copy for fast previews, for images with a long side over `PREVIEW_SIDE`.

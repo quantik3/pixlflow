@@ -7,6 +7,9 @@ A pixel sorter for Windows: a window with live preview, plus a command line. The
 each path, and the pixels of each span are sorted by brightness, hue and other values — or processed
 by an effect (stretch, gradient, glitch…). Works on images and video.
 
+Inspired by [pixelsortery](https://github.com/Lxtharia/pixelsortery) by Lxtharia. Pixlflow is its own
+implementation and contains none of its code.
+
 ## Features
 
 - **20 path kinds**: rows and columns, diagonals at any angle, rays, circles and ellipses, spirals

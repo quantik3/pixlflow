@@ -3,6 +3,7 @@
 use super::{tex_options, App, Pick, Tool};
 use eframe::egui::{self, pos2, vec2, Color32, ColorImage, PointerButton, Rect, Sense, Stroke};
 use pixlflow::{brush, settings::PathKind};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 pub struct View {
@@ -13,11 +14,13 @@ pub struct View {
     pub fit_pending: bool,
     /// Compare divider, as a fraction of the view width.
     divider: f32,
+    /// View size on the last frame, to follow window resizes.
+    size: egui::Vec2,
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { zoom: 1.0, offset: egui::Vec2::ZERO, fit_pending: true, divider: 0.5 }
+        View { zoom: 1.0, offset: egui::Vec2::ZERO, fit_pending: true, divider: 0.5, size: egui::Vec2::ZERO }
     }
 }
 
@@ -39,6 +42,16 @@ impl App {
         let size = vec2(doc.w as f32, doc.h as f32);
         let fit = (rect.width() / size.x).min(rect.height() / size.y);
         let v = &mut self.view;
+        if v.size != rect.size() {
+            // a fitted image stays fitted; a zoomed one keeps the same point in the middle of the view
+            let old_fit = (v.size.x / size.x).min(v.size.y / size.y);
+            if (v.zoom / old_fit - 1.0).abs() < 1e-3 {
+                v.fit_pending = true;
+            } else {
+                v.offset += (rect.size() - v.size) / 2.0;
+            }
+            v.size = rect.size();
+        }
         if v.fit_pending || resp.double_clicked() {
             v.zoom = fit;
             v.offset = (rect.size() - size * fit) / 2.0;
@@ -94,8 +107,9 @@ impl App {
                 self.pick = None;
             }
         } else if self.brush.on {
+            let before = self.overlay_key();
             let dirty = self.paint(ui, &resp, to_image);
-            self.draw_overlay(ui.ctx(), &painter, img, dirty);
+            self.draw_overlay(ui.ctx(), &painter, img, dirty, before);
             if let Some((pts, _)) = &self.brush.shape {
                 let outline = if self.brush.tool == Tool::Rect { brush::rect_points(pts[0], pts[pts.len() - 1]).to_vec() } else { pts.clone() };
                 let screen: Vec<_> = outline.iter().map(|q| img.min + vec2(q.0, q.1) * zoom).collect();
@@ -190,18 +204,23 @@ impl App {
         dirty
     }
 
+    /// What the overlay shows: (layer, tool, buffer address).
+    fn overlay_key(&self) -> Option<(usize, Tool, usize)> {
+        let l = &self.layers[self.cur];
+        Some(match self.brush.tool {
+            Tool::Directions => (self.cur, Tool::Directions, Arc::as_ptr(l.dirs.as_ref()?) as usize),
+            _ => (self.cur, Tool::Mask, Arc::as_ptr(l.mask.as_ref()?) as usize),
+        })
+    }
+
     /// Mask as translucent red (where sorted), directions coloured by angle. Uploads only the changed area.
-    fn draw_overlay(&mut self, ctx: &egui::Context, painter: &egui::Painter, img: Rect, dirty: Option<brush::Area>) {
-        let tool = if self.brush.tool == Tool::Directions { Tool::Directions } else { Tool::Mask };
+    /// `before`: the overlay key before this frame's painting.
+    fn draw_overlay(&mut self, ctx: &egui::Context, painter: &egui::Painter, img: Rect, dirty: Option<brush::Area>, before: Option<(usize, Tool, usize)>) {
+        let Some(key) = self.overlay_key() else { return };
+        let tool = key.1;
         let l = &self.layers[self.cur];
         let Some(doc) = &mut self.doc else { return };
         let (w, h) = (doc.w, doc.h);
-        let ptr = match tool {
-            Tool::Mask | Tool::Rect | Tool::Lasso => l.mask.as_ref().map(|m| Arc::as_ptr(m) as usize),
-            Tool::Directions => l.dirs.as_ref().map(|d| Arc::as_ptr(d) as usize),
-        };
-        let Some(ptr) = ptr else { return };
-        let key = (self.cur, tool, ptr);
         let pixel = |i: usize| match tool {
             Tool::Mask | Tool::Rect | Tool::Lasso => Color32::from_rgba_unmultiplied(255, 40, 40, (l.mask.as_ref().unwrap()[i] as f32 * 0.45) as u8),
             Tool::Directions => {
@@ -214,11 +233,14 @@ impl App {
             }
         };
         let region = |a: brush::Area| {
-            let pixels = (a[1]..a[3]).flat_map(|y| (a[0]..a[2]).map(move |x| y * w + x)).map(&pixel).collect();
+            // parallel: a whole-image rebuild (new mask, layer switch, undo) is tens of millions of pixels
+            let pixels = (a[1]..a[3]).into_par_iter().flat_map_iter(|y| (a[0]..a[2]).map(move |x| y * w + x)).map(&pixel).collect();
             ColorImage::new([a[2] - a[0], a[3] - a[1]], pixels)
         };
         match &mut doc.overlay {
-            Some((tex, k)) if *k == key => {
+            // painting copies a buffer that undo and sorting still share; the copy differs only in `dirty`
+            Some((tex, k)) if *k == key || (dirty.is_some() && Some(*k) == before) => {
+                *k = key;
                 if let Some(a) = dirty {
                     tex.set_partial([a[0], a[1]], region(a), tex_options());
                 }
