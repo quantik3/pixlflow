@@ -23,7 +23,7 @@ by an effect (stretch, gradient, glitch…). Works on images and video.
 - **Extras**: herringbone (Alternate), single-channel sorting, posterize, soft span edges, chromatic
   aberration.
 - **Layers** with 10 blend modes and opacity; each layer has its own mask, guide and directions.
-- **Brushes**: mask (radius, hardness) and directions; masks from a threshold, a guide or a file.
+- **Brushes**: mask (radius, hardness), rectangle and lasso for the mask (with a soft edge), and directions; masks from a threshold, a guide or a file.
 - **Presets** — a layer's settings as one line of text; a named list, Random.
 - **Animation** of a layer between two states → GIF or PNG frames.
 - **Projects** (`.pxlf`): all layers, masks and directions together with the source path.
@@ -64,13 +64,15 @@ on a smaller copy.
 | F, double click | fit the image to the window |
 | wheel / middle button | zoom at cursor / pan |
 | brush: left / right button | paint / erase (swapped with the Erase checkbox) |
+| Rect / Lasso: drag | fill the mask in a rectangle / a drawn outline (right button erases) |
 
 **Compare** shows source and result with a draggable divider. **Pick on image** sets a path's
 center or a color by clicking the image.
 
 **Layers**: "+ Add" adds a layer above the current one, "X" or a middle click deletes it. Each layer
 is applied to the result of the layers below; after a change only that layer and the ones above it
-are recomputed.
+are recomputed. The window shows the whole stack; "Up to this layer" shows the selected layer's result
+without the layers above it (saving still uses all layers).
 
 **Video** opens on its first frame, which is edited like an image. "Frame at" picks another frame,
 "Play sorted" shows the sorted video in a player window, "Export video…" writes a file with audio.

@@ -96,7 +96,14 @@ impl App {
         } else if self.brush.on {
             let dirty = self.paint(ui, &resp, to_image);
             self.draw_overlay(ui.ctx(), &painter, img, dirty);
-            if let Some(p) = resp.hover_pos() {
+            if let Some((pts, _)) = &self.brush.shape {
+                let outline = if self.brush.tool == Tool::Rect { brush::rect_points(pts[0], pts[pts.len() - 1]).to_vec() } else { pts.clone() };
+                let screen: Vec<_> = outline.iter().map(|q| img.min + vec2(q.0, q.1) * zoom).collect();
+                painter.add(egui::Shape::closed_line(screen.clone(), Stroke::new(3.0, Color32::BLACK)));
+                painter.add(egui::Shape::closed_line(screen, Stroke::new(1.0, Color32::WHITE)));
+            } else if matches!(self.brush.tool, Tool::Rect | Tool::Lasso) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else if let Some(p) = resp.hover_pos() {
                 painter.circle_stroke(p, self.brush.radius * zoom, Stroke::new(1.0, Color32::WHITE));
                 painter.circle_stroke(p, self.brush.radius * zoom + 1.0, Stroke::new(1.0, Color32::BLACK));
             }
@@ -107,7 +114,35 @@ impl App {
     fn paint(&mut self, ui: &egui::Ui, resp: &egui::Response, to_image: impl Fn(egui::Pos2) -> (f32, f32)) -> Option<brush::Area> {
         let (pos, primary, secondary) = ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.secondary_down()));
         let b = &mut self.brush;
-        if !resp.is_pointer_button_down_on() || !(primary || secondary) {
+        let down = resp.is_pointer_button_down_on() && (primary || secondary);
+        if matches!(b.tool, Tool::Rect | Tool::Lasso) {
+            // drag an outline (rectangle: start and current corner; lasso: the path), fill it on release
+            match (down, pos.map(&to_image), &mut b.shape) {
+                (true, Some(p), None) => b.shape = Some((vec![p, p], secondary != b.erase)),
+                (true, Some(p), Some((pts, _))) => {
+                    let last = pts[pts.len() - 1];
+                    if b.tool == Tool::Rect {
+                        pts[1] = p;
+                    } else if (last.0 - p.0).hypot(last.1 - p.1) >= 1.0 {
+                        pts.push(p);
+                    }
+                }
+                (false, _, Some(_)) => {
+                    let (pts, erase) = b.shape.take()?;
+                    let outline = if b.tool == Tool::Rect { brush::rect_points(pts[0], pts[1]).to_vec() } else { pts };
+                    let twice_area: f32 = outline.iter().zip(outline.iter().cycle().skip(1)).map(|(a, c)| a.0 * c.1 - c.0 * a.1).sum();
+                    if twice_area.abs() < 2.0 {
+                        return None; // a click, not a shape: don't create an empty mask
+                    }
+                    let (w, h) = (self.doc.as_ref()?.w, self.doc.as_ref()?.h);
+                    let m = Arc::make_mut(self.layers[self.cur].mask.get_or_insert_with(|| Arc::new(vec![if erase { 255 } else { 0 }; w * h])));
+                    return brush::fill_shape(m, w, h, &outline, b.feather, erase);
+                }
+                _ => {}
+            }
+            return None;
+        }
+        if !down {
             b.last = None;
             return None;
         }
@@ -149,6 +184,7 @@ impl App {
                     }
                 }
             }
+            Tool::Rect | Tool::Lasso => {} // handled above
         }
         b.last = Some(p);
         dirty
@@ -156,18 +192,18 @@ impl App {
 
     /// Mask as translucent red (where sorted), directions coloured by angle. Uploads only the changed area.
     fn draw_overlay(&mut self, ctx: &egui::Context, painter: &egui::Painter, img: Rect, dirty: Option<brush::Area>) {
-        let tool = self.brush.tool;
+        let tool = if self.brush.tool == Tool::Directions { Tool::Directions } else { Tool::Mask };
         let l = &self.layers[self.cur];
         let Some(doc) = &mut self.doc else { return };
         let (w, h) = (doc.w, doc.h);
         let ptr = match tool {
-            Tool::Mask => l.mask.as_ref().map(|m| Arc::as_ptr(m) as usize),
+            Tool::Mask | Tool::Rect | Tool::Lasso => l.mask.as_ref().map(|m| Arc::as_ptr(m) as usize),
             Tool::Directions => l.dirs.as_ref().map(|d| Arc::as_ptr(d) as usize),
         };
         let Some(ptr) = ptr else { return };
         let key = (self.cur, tool, ptr);
         let pixel = |i: usize| match tool {
-            Tool::Mask => Color32::from_rgba_unmultiplied(255, 40, 40, (l.mask.as_ref().unwrap()[i] as f32 * 0.45) as u8),
+            Tool::Mask | Tool::Rect | Tool::Lasso => Color32::from_rgba_unmultiplied(255, 40, 40, (l.mask.as_ref().unwrap()[i] as f32 * 0.45) as u8),
             Tool::Directions => {
                 let a = l.dirs.as_ref().unwrap()[i];
                 if a.is_nan() {

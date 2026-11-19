@@ -81,6 +81,10 @@ enum Pick {
 enum Tool {
     Mask,
     Directions,
+    /// Drag a rectangle; it fills the mask on release.
+    Rect,
+    /// Draw a free outline; it fills the mask on release.
+    Lasso,
 }
 
 struct Brush {
@@ -92,6 +96,10 @@ struct Brush {
     erase: bool,
     /// Last stamp position (image pixels) of the stroke in progress.
     last: Option<(f32, f32)>,
+    /// Rect / Lasso outline being dragged (image pixels; Rect: start and current corner), erase.
+    shape: Option<(Vec<(f32, f32)>, bool)>,
+    /// Soft edge of Rect / Lasso fills, px.
+    feather: f32,
 }
 
 /// Layers plus the current layer index.
@@ -140,6 +148,8 @@ pub struct App {
     compare: bool,
     show_mask: bool,
     show_original: bool,
+    /// Show the result of the selected layer and those below it instead of the whole stack.
+    upto_current: bool,
     pick: Option<Pick>,
     brush: Brush,
     view: view::View,
@@ -182,8 +192,9 @@ impl App {
             compare: false,
             show_mask: false,
             show_original: false,
+            upto_current: false,
             pick: None,
-            brush: Brush { on: false, tool: Tool::Mask, radius: 40.0, hardness: 0.5, erase: false, last: None },
+            brush: Brush { on: false, tool: Tool::Mask, radius: 40.0, hardness: 0.5, erase: false, last: None, shape: None, feather: 0.0 },
             view: view::View::default(),
             out_dir: None,
             fixed_output,
@@ -562,9 +573,9 @@ impl App {
         let (w, h, src) = (doc.w, doc.h, doc.src.clone());
         let small = doc.small.as_ref().map(|s| (s.w, s.h, s.src.clone()));
         let dragging = ctx.input(|i| i.pointer.any_down());
-        let (changed, last_kind) = match &self.requested {
-            Some((l, c, k)) => (*l != self.layers || (self.show_mask && *c != self.cur), Some(*k)),
-            None => (true, None),
+        let (changed, last_kind, moved) = match &self.requested {
+            Some((l, c, k)) => (*l != self.layers || (self.show_mask && *c != self.cur), Some(*k), *c != self.cur),
+            None => (true, None, false),
         };
         let kind = if self.show_mask {
             Kind::Mask
@@ -574,6 +585,7 @@ impl App {
             Kind::Full
         };
         let need = self.sort_now
+            || (self.upto_current && moved)
             || match kind {
                 Kind::Mask => changed || last_kind != Some(Kind::Mask),
                 Kind::Preview => changed && self.auto_sort,
@@ -585,7 +597,7 @@ impl App {
         self.sort_now = false;
         self.requested = Some((self.layers.clone(), self.cur, kind));
         self.next_id += 1;
-        let (n, full) = (self.layers.len(), (w, h));
+        let (n, full) = (if self.upto_current { self.cur + 1 } else { self.layers.len() }, (w, h));
         let job = match (small, kind) {
             (Some((sw, sh, small_src)), Kind::Preview) => Job {
                 id: self.next_id,
@@ -594,7 +606,7 @@ impl App {
                 w: sw,
                 h: sh,
                 full,
-                layers: self.layers.clone(),
+                layers: self.layers[..n].to_vec(),
                 start: 0,
             },
             _ => {
@@ -603,7 +615,7 @@ impl App {
                 if start == end {
                     // everything cached: show it right away
                     self.shown_id = self.next_id;
-                    let img = self.cache[n - 1].1.clone();
+                    let img = self.cache[end - 1].1.clone();
                     self.show(w, h, &img, true);
                     return;
                 }

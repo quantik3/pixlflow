@@ -244,6 +244,10 @@ impl App {
                 self.add_layer();
             }
             ui.toggle_value(&mut self.show_original, "Show original");
+            let upto = ui.toggle_value(&mut self.upto_current, "Up to this layer");
+            if upto.on_hover_text("Show the selected layer's result, without the layers above it. Saving still uses all layers.").changed() {
+                self.sort_now = true;
+            }
         });
         let mut delete = None;
         for i in (0..self.layers.len()).rev() {
@@ -277,14 +281,20 @@ impl App {
         egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show(ui, |ui| {
             let b = &mut self.brush;
             egui::Grid::new("brush").num_columns(2).spacing([10.0, 6.0]).min_col_width(80.0).show(ui, |ui| {
-                row(ui, "Brush", |ui| {
+                row(ui, "Brush", |ui| ui.toggle_value(&mut b.on, "On (B)"));
+                row(ui, "Tool", |ui| {
                     ui.horizontal(|ui| {
-                        ui.toggle_value(&mut b.on, "On (B)");
                         ui.selectable_value(&mut b.tool, Tool::Mask, "Mask");
+                        ui.selectable_value(&mut b.tool, Tool::Rect, "Rect").on_hover_text("Drag a rectangle to fill the mask");
+                        ui.selectable_value(&mut b.tool, Tool::Lasso, "Lasso").on_hover_text("Draw an outline to fill the mask");
                         ui.selectable_value(&mut b.tool, Tool::Directions, "Directions");
                     })
                 });
-                row(ui, "Radius", |ui| ui.add(Slider::new(&mut b.radius, 1.0..=1000.0).logarithmic(true).suffix(" px")));
+                if matches!(b.tool, Tool::Rect | Tool::Lasso) {
+                    row(ui, "Soft edge", |ui| ui.add(Slider::new(&mut b.feather, 0.0..=200.0).integer().suffix(" px")));
+                } else {
+                    row(ui, "Radius", |ui| ui.add(Slider::new(&mut b.radius, 1.0..=1000.0).logarithmic(true).suffix(" px")));
+                }
                 if b.tool == Tool::Mask {
                     row(ui, "Hardness", |ui| ui.add(Slider::new(&mut b.hardness, 0.0..=1.0)));
                 }
